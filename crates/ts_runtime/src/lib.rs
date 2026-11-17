@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use crate::{
     control_runner::ControlRunner, dataplane::DataplaneActor, env::RegForwarded,
     multiderp::Multiderp, netstack_actor::NetstackActor, peer_tracker::PeerTracker,
+    route_updater::RouteUpdater,
 };
 
 /// Control runner.
@@ -37,6 +38,7 @@ pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
 pub use kameo::actor::{ActorRef, Spawn};
 pub use registry::Registry;
+pub use route_updater::PathKind;
 pub use task::{ErasedTask, Task};
 
 /// The runtime for a tailscale device.
@@ -186,6 +188,7 @@ forward!(
     control_runner::SelfNode,
     control_runner::AuthUrl,
 );
+forward!(RouteUpdater, route_updater::PeerPath);
 forward!(
     PeerTracker,
     peer_tracker::PeerByName,
