@@ -206,6 +206,8 @@ impl Device {
             control_config: config.into(),
             auth_key,
             keys,
+            udp_buffer_size: config.udp_buffer_size,
+            udp_message_count: config.udp_message_count,
         });
 
         rt.wait_for_startup_result()

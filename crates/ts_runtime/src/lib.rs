@@ -53,6 +53,10 @@ pub struct Config {
     pub auth_key: Option<String>,
     /// The keys to use.
     pub keys: ts_keys::NodeState,
+    /// The size in bytes of the receive buffer of each UDP socket the netstack makes.
+    pub udp_buffer_size: usize,
+    /// The number of datagrams each UDP socket's receive buffer holds at most.
+    pub udp_message_count: usize,
 }
 
 impl kameo::Actor for Runtime {
@@ -118,6 +122,8 @@ impl kameo::Actor for Runtime {
                 netstack::netcore::Config {
                     tcp_buffer_size: 64 * 1024,
                     command_channel_capacity: Some(128),
+                    udp_buffer_size: config.udp_buffer_size,
+                    udp_message_count: config.udp_message_count,
                     ..Default::default()
                 },
                 netstack_id,
