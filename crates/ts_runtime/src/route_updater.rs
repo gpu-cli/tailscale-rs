@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
 use kameo::{
     actor::ActorRef,
@@ -120,6 +120,46 @@ impl kameo::Actor for RouteUpdater {
             best_paths: Default::default(),
             env,
         })
+    }
+}
+
+/// How traffic to a peer currently travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathKind {
+    /// Straight to the peer, over a path discovered with disco.
+    Direct,
+    /// Through a DERP relay.
+    Derp,
+}
+
+/// Asks how traffic to the peer with tailnet address `ip` currently travels.
+///
+/// Replies `None` when no peer has that address or it has no route yet.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerPath {
+    /// The peer's tailnet address.
+    pub ip: IpAddr,
+}
+
+impl Message<PeerPath> for RouteUpdater {
+    type Reply = Option<PathKind>;
+
+    async fn handle(
+        &mut self,
+        PeerPath { ip }: PeerPath,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Option<PathKind> {
+        let (id, peer) = self.peer_state.peers.get(&ip)?;
+        if self.best_paths.contains_key(&id) {
+            Some(PathKind::Direct)
+        } else if peer
+            .derp_region
+            .is_some_and(|region| self.derp_transport_map.0.contains_key(&region))
+        {
+            Some(PathKind::Derp)
+        } else {
+            None
+        }
     }
 }
 
