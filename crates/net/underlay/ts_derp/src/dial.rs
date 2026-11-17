@@ -168,6 +168,7 @@ pub async fn dial_server(server: &ServerConnInfo) -> Result<Option<TcpStream>, E
 
     while let Some(task) = js.join_next().await {
         let Some(task) = finished(task) else {
+            last_error = Some(io::Error::new(io::ErrorKind::Interrupted, "dial cancelled"));
             continue;
         };
         match task {
@@ -190,7 +191,7 @@ pub async fn dial_server(server: &ServerConnInfo) -> Result<Option<TcpStream>, E
 }
 
 /// A dial task's result, or `None` if it was cancelled. A dial task is cancelled when its
-/// runtime shuts down, e.g. during a graceful device shutdown, which is not an error; its
+/// runtime shuts down, e.g. during a graceful device shutdown, which must not panic; its
 /// panic is forwarded as the caller's own.
 fn finished<T>(task: Result<T, tokio::task::JoinError>) -> Option<T> {
     match task {
