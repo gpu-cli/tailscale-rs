@@ -167,9 +167,10 @@ pub async fn dial_server(server: &ServerConnInfo) -> Result<Option<TcpStream>, E
     let mut last_error = None;
 
     while let Some(task) = js.join_next().await {
-        // A JoinError is either a cancellation (not the case by inspection) or a task panic.
-        // Hence, this unwrap just forwards the inner panic, which is the behavior we want here.
-        match task.unwrap() {
+        let Some(task) = finished(task) else {
+            continue;
+        };
+        match task {
             Ok(Some(stream)) => return Ok(Some(stream)),
             Ok(None) => {
                 continue;
@@ -188,6 +189,17 @@ pub async fn dial_server(server: &ServerConnInfo) -> Result<Option<TcpStream>, E
     }
 }
 
+/// A dial task's result, or `None` if it was cancelled. A dial task is cancelled when its
+/// runtime shuts down, e.g. during a graceful device shutdown, which is not an error; its
+/// panic is forwarded as the caller's own.
+fn finished<T>(task: Result<T, tokio::task::JoinError>) -> Option<T> {
+    match task {
+        Ok(task) => Some(task),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => None,
+    }
+}
+
 #[tracing::instrument(skip_all, level = "trace")]
 async fn dial_by_ipusage(
     ip: IpUsage<impl Into<IpAddr>>,
@@ -202,5 +214,24 @@ async fn dial_by_ipusage(
             TcpStream::connect((ip, port)).await.map(Some)
         }
         IpUsage::UseDns => TcpStream::connect((hostname, port)).await.map(Some),
+    }
+}
+
+#[cfg(test)]
+mod finished_test {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_cancelled_dial_is_skipped() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        assert_eq!(finished(task.await), None);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "dial failed")]
+    async fn a_panicking_dial_panics_the_caller() {
+        let task = tokio::spawn(async { panic!("dial failed") });
+        finished(task.await);
     }
 }
