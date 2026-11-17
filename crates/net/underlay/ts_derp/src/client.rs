@@ -34,7 +34,10 @@ pub struct Client<Io> {
 pub async fn connect<'c>(
     region: impl IntoIterator<Item = &'c ServerConnInfo>,
 ) -> Result<Option<DefaultIo>, Error> {
-    let Some((conn, _, addr)) = crate::dial::dial_region_tls(region).await.unwrap() else {
+    let Some((conn, _, addr)) = crate::dial::dial_region_tls(region)
+        .await
+        .map_err(std::io::Error::other)?
+    else {
         return Ok(None);
     };
 
@@ -214,7 +217,14 @@ impl Client<DefaultIo> {
         region: impl IntoIterator<Item = &'c ServerConnInfo>,
         node_keypair: &NodeKeyPair,
     ) -> Result<Self, Error> {
-        let conn = connect(region).await?.unwrap();
+        // No server is reachable when the network is down, or when the dials were cancelled
+        // because the runtime is shutting down.
+        let conn = connect(region).await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "no derp server in the region could be reached",
+            )
+        })?;
 
         Client::handshake(conn, node_keypair).await
     }
@@ -313,5 +323,17 @@ where
             .recv_one()
             .await
             .map(|(k, pkt)| (DynEndpoint::derp(k), [pkt]))]
+    }
+}
+
+#[cfg(test)]
+mod connect_test {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unreachable_region_is_an_error() {
+        let region: [ServerConnInfo; 0] = [];
+        let connected = Client::connect(&region, &NodeKeyPair::random()).await;
+        assert!(matches!(connected, Err(Error::IoFailure(_))));
     }
 }
