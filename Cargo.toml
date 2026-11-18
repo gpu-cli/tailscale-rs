@@ -261,5 +261,8 @@ name = "peer_ping"
 name = "tcp_echo"
 
 [[example]]
+name = "pair_reach"
+
+[[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]
