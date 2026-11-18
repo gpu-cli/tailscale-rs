@@ -459,6 +459,9 @@ mod test {
     #[tokio::test]
     async fn a_told_forward_to_a_missing_actor_leaves_the_registry_running() {
         let registry = Registry::spawn_default();
+        // Kameo drops the rest of the startup buffer after an error in it; a running registry is
+        // the case this covers.
+        registry.wait_for_startup().await;
 
         registry
             .tell(Forward::<Echo, _>::new(None, Ping))
