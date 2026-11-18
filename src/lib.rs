@@ -132,6 +132,8 @@ pub use config::Config;
 pub use error::{Error, InternalErrorKind};
 #[doc(inline)]
 pub use ts_control::Node as NodeInfo;
+#[doc(inline)]
+pub use ts_runtime::PathKind;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
 use ts_runtime::{Spawn, control_runner::AuthResponse};
 
@@ -206,6 +208,8 @@ impl Device {
             control_config: config.into(),
             auth_key,
             keys,
+            udp_buffer_size: config.udp_buffer_size,
+            udp_message_count: config.udp_message_count,
         });
 
         rt.wait_for_startup_result()
@@ -312,6 +316,19 @@ impl Device {
     pub async fn peer_by_tailnet_ip(&self, ip: IpAddr) -> Result<Option<NodeInfo>, Error> {
         self.runtime
             .ask(ts_runtime::peer_tracker::PeerByTailnetIp { ip })
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
+    }
+
+    /// How traffic to the peer with tailnet address `ip` currently travels: straight to it,
+    /// or through a DERP relay. `None` when no peer has that address or it has no route yet.
+    ///
+    /// Path discovery runs for peers this device sends to, so a peer it has not sent to
+    /// recently reports [`PathKind::Derp`] until a direct path is found.
+    pub async fn peer_path(&self, ip: IpAddr) -> Result<Option<PathKind>, Error> {
+        self.runtime
+            .ask(ts_runtime::PeerPath { ip })
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)

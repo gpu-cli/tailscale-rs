@@ -8,6 +8,12 @@ const CONTROL_URL_VAR: &str = "TS_CONTROL_URL";
 const HOSTNAME_VAR: &str = "TS_HOSTNAME";
 const AUTHKEY_VAR: &str = "TS_AUTH_KEY";
 
+/// The default for [`Config::udp_buffer_size`].
+pub const DEFAULT_UDP_BUFFER_SIZE: usize = 4 * 1024;
+
+/// The default for [`Config::udp_message_count`].
+pub const DEFAULT_UDP_MESSAGE_COUNT: usize = 32;
+
 /// Config for connecting to Tailscale.
 pub struct Config {
     /// The cryptographic keys representing this node's identity.
@@ -41,6 +47,16 @@ pub struct Config {
     ///
     /// [KB article on ephemeral nodes]: https://tailscale.com/docs/features/ephemeral-nodes
     pub ephemeral: bool,
+
+    /// The size in bytes of the receive buffer of each UDP socket made with
+    /// [`Device::udp_bind`](crate::Device::udp_bind).
+    ///
+    /// Datagrams that arrive while the buffer is full are dropped. A protocol that sends in
+    /// bursts, such as QUIC, needs room for a whole burst.
+    pub udp_buffer_size: usize,
+
+    /// The number of datagrams each UDP socket's receive buffer holds at most.
+    pub udp_message_count: usize,
 }
 
 impl Config {
@@ -140,6 +156,8 @@ impl Default for Config {
             requested_hostname: None,
             requested_tags: vec![],
             ephemeral: false,
+            udp_buffer_size: DEFAULT_UDP_BUFFER_SIZE,
+            udp_message_count: DEFAULT_UDP_MESSAGE_COUNT,
         }
     }
 }
@@ -223,4 +241,17 @@ async fn try_write(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod udp_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn udp_defaults_match_the_netstack() {
+        let netstack = ts_netstack_smoltcp::netcore::Config::default();
+        let config = Config::default();
+        assert_eq!(config.udp_buffer_size, netstack.udp_buffer_size);
+        assert_eq!(config.udp_message_count, netstack.udp_message_count);
+    }
 }

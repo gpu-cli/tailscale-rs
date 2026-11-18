@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use crate::{
     control_runner::ControlRunner, dataplane::DataplaneActor, env::RegForwarded,
     multiderp::Multiderp, netstack_actor::NetstackActor, peer_tracker::PeerTracker,
+    route_updater::RouteUpdater,
 };
 
 /// Control runner.
@@ -37,6 +38,7 @@ pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
 pub use kameo::actor::{ActorRef, Spawn};
 pub use registry::Registry;
+pub use route_updater::PathKind;
 pub use task::{ErasedTask, Task};
 
 /// The runtime for a tailscale device.
@@ -53,6 +55,10 @@ pub struct Config {
     pub auth_key: Option<String>,
     /// The keys to use.
     pub keys: ts_keys::NodeState,
+    /// The size in bytes of the receive buffer of each UDP socket the netstack makes.
+    pub udp_buffer_size: usize,
+    /// The number of datagrams each UDP socket's receive buffer holds at most.
+    pub udp_message_count: usize,
 }
 
 impl kameo::Actor for Runtime {
@@ -118,6 +124,8 @@ impl kameo::Actor for Runtime {
                 netstack::netcore::Config {
                     tcp_buffer_size: 64 * 1024,
                     command_channel_capacity: Some(128),
+                    udp_buffer_size: config.udp_buffer_size,
+                    udp_message_count: config.udp_message_count,
                     ..Default::default()
                 },
                 netstack_id,
@@ -180,6 +188,7 @@ forward!(
     control_runner::SelfNode,
     control_runner::AuthUrl,
 );
+forward!(RouteUpdater, route_updater::PeerPath);
 forward!(
     PeerTracker,
     peer_tracker::PeerByName,
