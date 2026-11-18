@@ -108,7 +108,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let fresh = device(format!("tsrs-churn-{tag}-{round}-after"), auth_key.clone()).await?;
         match reach(&fresh, addr).await {
-            Ok(t) => println!("round {round}: a device after the group left reached the host in {t:?}"),
+            Ok(t) => {
+                println!("round {round}: a device after the group left reached the host in {t:?}")
+            }
             Err(e) => {
                 failures += 1;
                 println!("round {round}: a device after the group left: {e}");

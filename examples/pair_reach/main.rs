@@ -62,7 +62,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    let auth_key = tailscale::config::auth_key_from_env().or_else(|| std::env::var("TS_AUTHKEY").ok());
+    let auth_key =
+        tailscale::config::auth_key_from_env().or_else(|| std::env::var("TS_AUTHKEY").ok());
     let suffix = std::process::id();
     let a = device(&format!("tsrs-pair-a-{suffix}"), auth_key.clone()).await?;
     tracing::info!(ip = %a.ipv4_addr().await?, "a is up");

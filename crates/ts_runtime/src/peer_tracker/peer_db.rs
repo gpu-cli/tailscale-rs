@@ -184,14 +184,14 @@ impl PeerDb {
             |x| &x.tailnet_address,
             &mut self.index_state.ip_idx,
             |old, idx| {
-                for addr in [
-                    IpAddr::from(old.tailnet_address.ipv4),
-                    IpAddr::from(old.tailnet_address.ipv6),
+                for net in [
+                    ipnet::IpNet::from(old.tailnet_address.ipv4),
+                    ipnet::IpNet::from(old.tailnet_address.ipv6),
                 ] {
-                    if idx.lookup(addr).is_some_and(|&x| x == id) {
-                        idx.remove(addr.into());
+                    if idx.lookup(net.addr()).is_some_and(|&x| x == id) {
+                        idx.remove(net);
                     } else {
-                        tracing::warn!(?id, %addr, "tailnet address not indexed to this peer");
+                        tracing::warn!(?id, %net, "tailnet address not indexed to this peer");
                     }
                 }
             },
