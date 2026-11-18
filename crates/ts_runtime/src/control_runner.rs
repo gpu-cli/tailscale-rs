@@ -513,8 +513,9 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
             .await;
         }
 
-        if let Some(dial_plan) = &msg.dial_plan
-            && self
+        if let Some(dial_plan) = &msg.dial_plan {
+            // The plan only steers the next dial; the netmap update it came with matters more.
+            match self
                 .params
                 .env
                 .ask::<DialerActor, _>(
@@ -525,9 +526,11 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
                     true,
                 )
                 .await
-                .unwrap()
-        {
-            tracing::trace!(new_dial_plan = ?dial_plan);
+            {
+                Ok(true) => tracing::trace!(new_dial_plan = ?dial_plan),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "updating the control dial plan"),
+            }
         }
 
         if let Some(node) = msg.node.as_ref() {

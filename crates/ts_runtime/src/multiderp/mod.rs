@@ -72,14 +72,18 @@ impl kameo::Actor for Multiderp {
 impl Multiderp {
     #[tracing::instrument(skip_all, fields(region_id = %id))]
     async fn ensure_region(&mut self, slf: &ActorRef<Self>, id: RegionId, region: &DerpRegion) {
-        if self
+        match self
             .env
             .lookup_opt::<Uniderp>(Some(Uniderp::name(id)))
             .await
-            .unwrap()
-            .is_some()
         {
-            return;
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            // The next derp map update retries this region.
+            Err(e) => {
+                tracing::warn!(error = %e, "looking up the region's derp client");
+                return;
+            }
         }
 
         tracing::trace!("spawn new uniderp");
@@ -233,6 +237,8 @@ impl Message<SendDisco> for Multiderp {
             return;
         };
 
+        // A disco packet is best effort, like the UDP it stands in for: one the dataplane can't
+        // take now (its mailbox is full) is lost, and the next probe goes out as usual.
         let sent = self
             .env
             .ask::<DataplaneActor, _>(
@@ -244,9 +250,11 @@ impl Message<SendDisco> for Multiderp {
                 },
                 true,
             )
-            .await
-            .unwrap();
+            .await;
 
-        tracing::trace!(?sent, %nodekey, ?derp_region, "disco send result");
+        match sent {
+            Ok(sent) => tracing::trace!(?sent, %nodekey, ?derp_region, "disco send result"),
+            Err(e) => tracing::debug!(error = %e, %nodekey, ?derp_region, "disco send dropped"),
+        }
     }
 }
