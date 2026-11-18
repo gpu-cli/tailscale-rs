@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use kameo::{
     Reply,
     actor::{ActorRef, Spawn, WeakActorRef},
-    error::{ActorStopReason, BoxSendError, Infallible, PanicError, PanicReason, SendError},
+    error::{ActorStopReason, BoxSendError, Infallible, PanicError, SendError},
     message::{Context, Message},
     reply::{BoxReplySender, DelegatedReply, ForwardedReply, ReplyError},
 };
@@ -105,19 +105,20 @@ impl kameo::Actor for Registry {
         Ok(Self::default())
     }
 
-    /// Keeps the registry running when a told [`Forward`] finds its target missing or dead.
+    /// Keeps the registry running when handling one message fails.
     ///
-    /// Kameo hands an error reply to a `tell` to this hook, and the default stops the actor.
-    /// Every lookup, publish and ask on the device goes through the registry, so stopping it for
-    /// one undeliverable message (an actor mid-restart, say) cuts the device off from control for
-    /// good. A panic in a handler still stops it.
+    /// Kameo hands this hook an error reply to a `tell` (a [`Forward`] whose target is missing or
+    /// restarting), and a panic from inside kameo when a forward meets a full mailbox. The
+    /// default stops the actor. Every lookup, publish and ask on the device goes through the
+    /// registry, so stopping it for one undeliverable message cuts the device off for good.
+    /// Its handlers make single inserts and removals, so there is no half-applied state to protect.
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        if err.reason() == PanicReason::OnMessage {
-            tracing::debug!(error = %err, "dropped a told message the registry could not forward");
+        if err.reason().is_message_processing() {
+            tracing::warn!(error = %err, "registry dropped a message it could not handle");
             return Ok(ControlFlow::Continue(()));
         }
 
@@ -454,6 +455,54 @@ mod test {
         type Reply = ();
 
         async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) {}
+    }
+
+    /// Holds its handler until released, so its mailbox fills.
+    struct Stuck(Option<tokio::sync::oneshot::Receiver<()>>);
+
+    impl kameo::Actor for Stuck {
+        type Args = Self;
+        type Error = Infallible;
+
+        async fn on_start(args: Self, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(args)
+        }
+    }
+
+    impl Message<Ping> for Stuck {
+        type Reply = ();
+
+        async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) {
+            if let Some(release) = self.0.take() {
+                drop(release.await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forward_into_a_full_mailbox_leaves_the_registry_running() {
+        let registry = Registry::spawn_default();
+        registry.wait_for_startup().await;
+
+        let (release, held) = tokio::sync::oneshot::channel();
+        let stuck = Stuck::spawn_with_mailbox(Stuck(Some(held)), kameo::mailbox::bounded(1));
+        stuck.wait_for_startup().await;
+        registry.ask(Register::new(None, &stuck)).await.unwrap();
+
+        // One message held in the handler, one filling the mailbox.
+        stuck.tell(Ping).await.unwrap();
+        stuck.tell(Ping).await.unwrap();
+
+        assert!(
+            registry
+                .ask(Forward::<Stuck, _>::new(None, Ping))
+                .await
+                .is_err()
+        );
+        assert!(registry.is_alive());
+        assert!(registry.ask(Lookup::<Stuck>::new(None)).await.is_ok());
+
+        drop(release.send(()));
     }
 
     #[tokio::test]
