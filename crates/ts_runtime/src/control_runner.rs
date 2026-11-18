@@ -75,6 +75,17 @@ impl RegState {
     }
 }
 
+/// How long a request to control may take before the runner gives up on its connection.
+///
+/// Control answers these in well under a second; a request still open after this is on a
+/// connection that has died without closing.
+const CONTROL_REQUEST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
+
+/// How long the map stream may go without a message before the runner reconnects.
+///
+/// Control sends a keepalive on the stream about once a minute.
+const MAP_STREAM_SILENCE_LIMIT: core::time::Duration = core::time::Duration::from_secs(180);
+
 /// Control runner args.
 #[derive(Clone)]
 pub struct Params {
@@ -332,22 +343,42 @@ impl ControlRunner {
         f(request).await
     }
 
-    async fn update_map_request(&self) {
+    /// Sends control this node's current fields.
+    ///
+    /// On an error or a stalled request the runner stops, so its supervisor restarts it on a
+    /// fresh connection: this actor handles one message at a time, and a request left waiting on
+    /// a dead connection would hold back every netmap update and address lookup behind it.
+    async fn update_map_request(&self, ctx: &mut Context<Self, ()>) {
         let RegState::Registered(conn) = &self.state else {
             tracing::debug!("attempt to update map request while not registered");
             return;
         };
 
-        self.with_map_request(false, async |req| {
-            send_map_request(
-                req,
-                &self.params.config.server_url.join("machine/map").unwrap(),
-                conn,
-            )
-            .await
-        })
-        .await
-        .unwrap();
+        let sent = self
+            .with_map_request(false, async |req| {
+                tokio::time::timeout(
+                    CONTROL_REQUEST_TIMEOUT,
+                    send_map_request(
+                        req,
+                        &self.params.config.server_url.join("machine/map").unwrap(),
+                        conn,
+                    ),
+                )
+                .await
+            })
+            .await;
+
+        match sent {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "map update failed; reconnecting to control");
+                ctx.stop();
+            }
+            Err(_) => {
+                tracing::warn!("map update stalled; reconnecting to control");
+                ctx.stop();
+            }
+        }
     }
 }
 
@@ -406,12 +437,38 @@ impl Message<RegisterResult> for ControlRunner {
             .with_map_request(true, async |req| {
                 let map_url = self.params.config.server_url.join("machine/map").unwrap();
 
-                send_map_request(req, &map_url, &conn).await
+                tokio::time::timeout(
+                    CONTROL_REQUEST_TIMEOUT,
+                    send_map_request(req, &map_url, &conn),
+                )
+                .await
             })
-            .await
-            .unwrap();
+            .await;
 
-        let stream = map_stream(reader).map(Arc::new);
+        let reader = match reader {
+            Ok(Ok(reader)) => reader,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "map stream request failed; reconnecting to control");
+                ctx.stop();
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("map stream request stalled; reconnecting to control");
+                ctx.stop();
+                return;
+            }
+        };
+
+        // A stream that goes silent ends, which restarts the runner on a fresh connection.
+        let stream = tokio_stream::StreamExt::map_while(
+            tokio_stream::StreamExt::timeout(map_stream(reader), MAP_STREAM_SILENCE_LIMIT),
+            |update| {
+                update
+                    .inspect_err(|_| tracing::warn!("map stream went silent; reconnecting"))
+                    .ok()
+            },
+        )
+        .map(Arc::new);
 
         ctx.actor_ref().attach_stream(stream.boxed(), (), ());
     }
@@ -447,7 +504,13 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
         };
 
         if let RegState::Registered(conn) = &self.state {
-            let _ = handle_ping(&msg, &self.params.config.server_url, conn).await;
+            // A ping control can't get an answer to costs it a probe; one that stalls here would
+            // hold back the netmap update it came with.
+            let _ = tokio::time::timeout(
+                CONTROL_REQUEST_TIMEOUT,
+                handle_ping(&msg, &self.params.config.server_url, conn),
+            )
+            .await;
         }
 
         if let Some(dial_plan) = &msg.dial_plan
@@ -496,26 +559,26 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
 impl Message<direct::NewEndpoints> for ControlRunner {
     type Reply = ();
 
-    async fn handle(&mut self, msg: direct::NewEndpoints, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: direct::NewEndpoints, ctx: &mut Context<Self, Self::Reply>) {
         if self.endpoints == msg.0.as_ref() {
             return;
         }
 
         self.endpoints = msg.0.to_vec();
-        self.update_map_request().await;
+        self.update_map_request(ctx).await;
     }
 }
 
 impl Message<DerpLatencyMeasurement> for ControlRunner {
     type Reply = ();
 
-    async fn handle(&mut self, msg: DerpLatencyMeasurement, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: DerpLatencyMeasurement, ctx: &mut Context<Self, Self::Reply>) {
         if self.derp_latency_measurement.as_ref() == Some(&msg) {
             return;
         }
 
         self.derp_latency_measurement = Some(msg);
-        self.update_map_request().await;
+        self.update_map_request(ctx).await;
     }
 }
 
