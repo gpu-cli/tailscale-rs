@@ -1,8 +1,9 @@
 use core::{
     any::{Any, TypeId},
     marker::PhantomData,
+    sync::atomic::{AtomicUsize, Ordering},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::mpsc;
 
@@ -86,12 +87,29 @@ where
 /// from their own handlers, so a bus that waited on a full subscriber mailbox while that
 /// subscriber waited on the full bus mailbox would stop every publisher for good. A task per
 /// subscriber delivers its queue in order.
+///
+/// Unretained messages carry what peers send (disco and STUN packets), so a stalled subscriber
+/// holds at most [`UNRETAINED_QUEUE_LIMIT`] queued messages and the rest are dropped; those
+/// messages are best-effort and their senders retry. Retained messages are state from control and
+/// local actors whose loss would leave the subscriber with a wrong picture, so they always queue.
 struct Subscriber<M>
 where
     M: Send + 'static,
 {
     recipient: Recipient<M>,
     queue: mpsc::UnboundedSender<M>,
+    queued: Arc<AtomicUsize>,
+}
+
+/// The most messages queued for one subscriber past which unretained messages are dropped.
+const UNRETAINED_QUEUE_LIMIT: usize = 256;
+
+/// What became of a message handed to a [`Subscriber`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Queued {
+    Yes,
+    Dropped,
+    Gone,
 }
 
 impl<M> Subscriber<M>
@@ -101,9 +119,12 @@ where
     fn new(recipient: Recipient<M>) -> Self {
         let (queue, mut rx) = mpsc::unbounded_channel::<M>();
         let target = recipient.clone();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let delivered = queued.clone();
 
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
+                delivered.fetch_sub(1, Ordering::Relaxed);
                 // The actor stopped; dropping the receiver tells the bus.
                 if target.tell(message).await.is_err() {
                     return;
@@ -111,12 +132,25 @@ where
             }
         });
 
-        Self { recipient, queue }
+        Self {
+            recipient,
+            queue,
+            queued,
+        }
     }
 
-    /// Queues `message`; false if the subscriber is gone.
-    fn send(&self, message: M) -> bool {
-        self.queue.send(message).is_ok()
+    /// Queues `message`, unless it is unretained and the subscriber is already behind.
+    fn send(&self, message: M, retained: bool) -> Queued {
+        if !retained && self.queued.load(Ordering::Relaxed) >= UNRETAINED_QUEUE_LIMIT {
+            return Queued::Dropped;
+        }
+
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        if self.queue.send(message).is_ok() {
+            Queued::Yes
+        } else {
+            Queued::Gone
+        }
     }
 
     fn is_alive(&self) -> bool {
@@ -184,10 +218,16 @@ where
 
         let mut any_missing = false;
 
-        for recip in state.recipients.values() {
-            // actor is dead (this is an expected case)
-            if !recip.send(message.clone()) {
-                any_missing = true;
+        for (id, recip) in &state.recipients {
+            match recip.send(message.clone(), retained) {
+                Queued::Yes => {}
+                Queued::Dropped => tracing::debug!(
+                    ?id,
+                    msgty = core::any::type_name::<M>(),
+                    "subscriber behind, dropping unretained message"
+                ),
+                // actor is dead (this is an expected case)
+                Queued::Gone => any_missing = true,
             }
         }
 
@@ -227,7 +267,7 @@ where
 
         let subscriber = Subscriber::new(recip.clone());
         if let Some(retained) = &state.retained
-            && !subscriber.send(retained.clone())
+            && subscriber.send(retained.clone(), true) == Queued::Gone
         {
             tracing::error!(id = ?recip.id(), "subscriber gone before its retained message");
         }
@@ -465,5 +505,108 @@ mod test {
         for publisher in publishers {
             publisher.await.unwrap();
         }
+    }
+
+    /// Never finishes a [`Tick`] until told to.
+    struct Stalled(Option<oneshot::Receiver<()>>);
+
+    impl kameo::Actor for Stalled {
+        type Args = Self;
+        type Error = kameo::error::Infallible;
+
+        async fn on_start(args: Self, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(args)
+        }
+    }
+
+    impl Message<Tick> for Stalled {
+        type Reply = ();
+
+        async fn handle(&mut self, _: Tick, _: &mut Context<Self, ()>) {
+            if let Some(release) = self.0.take() {
+                let _ = release.await;
+            }
+        }
+    }
+
+    /// Counts its [`Tick`]s.
+    #[derive(kameo::Actor)]
+    struct Counter(usize);
+
+    impl Message<Tick> for Counter {
+        type Reply = usize;
+
+        async fn handle(&mut self, _: Tick, _: &mut Context<Self, usize>) -> usize {
+            self.0 += 1;
+            self.0
+        }
+    }
+
+    struct Count;
+
+    impl Message<Count> for Counter {
+        type Reply = usize;
+
+        async fn handle(&mut self, _: Count, _: &mut Context<Self, usize>) -> usize {
+            self.0
+        }
+    }
+
+    struct QueuedFor(ActorId);
+
+    impl Message<QueuedFor> for RetainedBus {
+        type Reply = usize;
+
+        async fn handle(
+            &mut self,
+            QueuedFor(id): QueuedFor,
+            _: &mut Context<Self, usize>,
+        ) -> usize {
+            self.get::<Tick>()
+                .and_then(|state| state.recipients.get(&id))
+                .map_or(0, |sub| sub.queued.load(Ordering::Relaxed))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_subscriber_drops_unretained_messages_and_holds_up_no_one() {
+        const TICKS: usize = 4 * UNRETAINED_QUEUE_LIMIT;
+
+        let bus = RetainedBus::spawn_default();
+        bus.wait_for_startup().await;
+
+        let (release, stalled_until) = oneshot::channel();
+        let stalled =
+            Stalled::spawn_with_mailbox(Stalled(Some(stalled_until)), kameo::mailbox::bounded(1));
+        stalled.wait_for_startup().await;
+        bus.ask(Register(stalled.clone().recipient::<Tick>()))
+            .await
+            .unwrap();
+
+        let counter = Counter::spawn(Counter(0));
+        counter.wait_for_startup().await;
+        bus.ask(Register(counter.clone().recipient::<Tick>()))
+            .await
+            .unwrap();
+
+        for _ in 0..TICKS {
+            bus.tell(Publish::unretained(Tick)).await.unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while counter.ask(Count).await.unwrap() < TICKS {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a stalled subscriber held up another");
+
+        assert!(bus.ask(QueuedFor(stalled.id())).await.unwrap() <= UNRETAINED_QUEUE_LIMIT);
+
+        // Retained messages still queue for it, past the limit.
+        bus.tell(Publish::retained(Tick)).await.unwrap();
+        assert!(bus.ask(QueuedFor(stalled.id())).await.unwrap() > UNRETAINED_QUEUE_LIMIT);
+
+        let _ = release.send(());
     }
 }
