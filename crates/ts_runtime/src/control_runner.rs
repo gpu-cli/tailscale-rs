@@ -537,7 +537,9 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
             self.self_node = Some(node.clone());
         }
 
-        if let Err(e) = self.params.env.publish(msg).await {
+        // Ordered: a netmap update can be a delta, so none may be skipped. The wait is the map
+        // stream's backpressure; no subscriber of it waits on this actor.
+        if let Err(e) = self.params.env.publish_ordered(msg).await {
             tracing::error!(error = %e, "publishing netmap update");
         }
 

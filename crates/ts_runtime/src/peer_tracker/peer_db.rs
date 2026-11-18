@@ -248,6 +248,11 @@ impl PeerDb {
         Some((id, peer))
     }
 
+    /// Every peer in the db.
+    pub fn iter(&self) -> impl Iterator<Item = (PeerId, &Node)> {
+        self.peers.iter().map(|(&id, node)| (id, node))
+    }
+
     /// Get the nodes with the closest matching route.
     pub fn get_route(&self, route: ipnet::IpNet) -> impl Iterator<Item = (PeerId, &Node)> {
         // this doesn't use IndexedField because more than one result can be returned

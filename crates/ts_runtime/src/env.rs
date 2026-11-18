@@ -62,6 +62,26 @@ impl Env {
         Ok(())
     }
 
+    /// Publish a retained update that every subscriber must receive, in order; waits until each
+    /// subscriber's queue has room. Only for a publisher no subscriber of `M` ever waits on.
+    pub async fn publish_ordered<M>(&self, msg: M) -> Result<(), Error>
+    where
+        M: Clone + Send + 'static,
+    {
+        let queues = self
+            .bus
+            .ask(crate::retained_bus::PublishOrdered(msg.clone()))
+            .await
+            .with_actor_info(&self.bus)?;
+
+        for queue in queues {
+            // A closed queue is a subscriber that stopped; the bus drops it on its next publish.
+            let _ = queue.send(msg.clone()).await;
+        }
+
+        Ok(())
+    }
+
     pub async fn publish_noretain<M>(&self, msg: M) -> Result<(), Error>
     where
         M: Clone + Send + 'static,

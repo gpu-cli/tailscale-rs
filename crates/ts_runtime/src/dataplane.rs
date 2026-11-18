@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::{Debug, Formatter},
     sync::Arc,
 };
@@ -28,6 +29,8 @@ use crate::{
 pub struct DataplaneActor {
     dataplane: Arc<ts_dataplane::async_tokio::DataPlane>,
     env: Env,
+    /// The node key each WireGuard peer is configured with.
+    wg_peers: HashMap<ts_tunnel::PeerId, ts_keys::NodePublicKey>,
 }
 
 #[kameo::messages]
@@ -137,7 +140,11 @@ impl kameo::Actor for DataplaneActor {
         tracing::trace!("dataplane running");
         env.register(None, &slf).await?;
 
-        Ok(Self { dataplane, env })
+        Ok(Self {
+            dataplane,
+            env,
+            wg_peers: HashMap::new(),
+        })
     }
 }
 
@@ -318,22 +325,28 @@ impl Message<Arc<PeerState>> for DataplaneActor {
             let mut dp = self.dataplane.inner().await;
             let wg = &mut dp.wireguard;
 
-            // Deletions first: a node key a deleted peer held may now belong to an upserted one.
-            for delete in &msg.deletions {
-                wg.remove_peer(ts_tunnel::PeerId(delete.0));
-            }
+            // Reconciled against the whole peer db rather than the update's upserts and deletions:
+            // the bus keeps only the newest peer state for a subscriber that falls behind.
+            let want = msg
+                .peers
+                .iter()
+                .map(|(id, node)| (ts_tunnel::PeerId(id.0), node.node_key))
+                .collect::<HashMap<_, _>>();
 
-            for &upsert in &msg.upserts {
-                let Some((_, node)) = msg.peers.get(&upsert) else {
-                    tracing::error!(?upsert, "upserted peer missing from the peer db");
-                    continue;
-                };
+            // Removals first: a node key a removed peer held may now belong to another one.
+            self.wg_peers.retain(|id, key| {
+                let keep = want.get(id) == Some(key);
+                if !keep {
+                    wg.remove_peer(*id);
+                }
+                keep
+            });
 
-                wg.upsert_peer(ts_tunnel::PeerConfig::new(
-                    ts_tunnel::PeerId(upsert.0),
-                    node.node_key,
-                    [0u8; 32],
-                ));
+            for (id, key) in want {
+                if self.wg_peers.get(&id) != Some(&key) {
+                    wg.upsert_peer(ts_tunnel::PeerConfig::new(id, key, [0u8; 32]));
+                    self.wg_peers.insert(id, key);
+                }
             }
         }
 

@@ -471,7 +471,9 @@ impl Message<Arc<PeerState>> for PeerPd {
         // this actor, otherwise control flow to PathDiscoverer may get confused. we can wipe out
         // our endpoints and stop doing anything because that doesn't interfere.
 
-        if state.deletions.contains(&self.peer_id) {
+        // Absence from the db, not the update's deletions: the bus keeps only the newest peer
+        // state for a subscriber that falls behind, so a deletion's own update may be skipped.
+        if state.peers.get(&self.peer_id).is_none() {
             for ep in self
                 .endpoints_ctrl
                 .drain()
