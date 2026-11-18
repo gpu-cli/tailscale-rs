@@ -177,14 +177,16 @@ impl Env {
 
             match result {
                 Ok(x) => return Ok(x),
-                Err(e) => match e.unwrap_err() {
-                    SendError::ActorNotRunning(m) if wait => {
-                        msg = m;
-                    }
-                    e => {
-                        return Err(e).with_actor_info(&self.registry);
-                    }
-                },
+                Err(SendError::HandlerError(SendError::ActorNotRunning(m))) if wait => {
+                    msg = m;
+                }
+                Err(SendError::HandlerError(e)) => {
+                    return Err(e).with_actor_info(&self.registry);
+                }
+                // The registry didn't answer: it dropped the forward or isn't running.
+                Err(e) => {
+                    return Err(e).with_actor_info(&self.registry);
+                }
             }
 
             tracing::trace!("in ask: actor not available, wait until register");

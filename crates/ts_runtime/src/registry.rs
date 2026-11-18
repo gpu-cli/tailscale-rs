@@ -506,6 +506,24 @@ mod test {
     }
 
     #[tokio::test]
+    async fn an_ask_the_registry_drops_is_an_error_for_the_caller() {
+        let env = crate::env::Env::new(ts_keys::NodeState::generate());
+        env.registry.wait_for_startup().await;
+
+        let (release, held) = tokio::sync::oneshot::channel();
+        let stuck = Stuck::spawn_with_mailbox(Stuck(Some(held)), kameo::mailbox::bounded(1));
+        stuck.wait_for_startup().await;
+        env.register(None, &stuck).await.unwrap();
+        stuck.tell(Ping).await.unwrap();
+        stuck.tell(Ping).await.unwrap();
+
+        assert!(env.ask::<Stuck, _>(None, Ping, false).await.is_err());
+        assert!(env.registry.is_alive());
+
+        release.send(()).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_told_forward_to_a_missing_actor_leaves_the_registry_running() {
         let registry = Registry::spawn_default();
         // Kameo drops the rest of the startup buffer after an error in it; a running registry is
