@@ -1,13 +1,14 @@
 use core::{
     any::{Any, TypeId, type_name},
     marker::PhantomData,
+    ops::ControlFlow,
 };
 use std::collections::HashMap;
 
 use kameo::{
     Reply,
     actor::{ActorRef, Spawn, WeakActorRef},
-    error::{BoxSendError, Infallible, SendError},
+    error::{ActorStopReason, BoxSendError, Infallible, PanicError, PanicReason, SendError},
     message::{Context, Message},
     reply::{BoxReplySender, DelegatedReply, ForwardedReply, ReplyError},
 };
@@ -102,6 +103,25 @@ impl kameo::Actor for Registry {
 
     async fn on_start(_args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         Ok(Self::default())
+    }
+
+    /// Keeps the registry running when a told [`Forward`] finds its target missing or dead.
+    ///
+    /// Kameo hands an error reply to a `tell` to this hook, and the default stops the actor.
+    /// Every lookup, publish and ask on the device goes through the registry, so stopping it for
+    /// one undeliverable message (an actor mid-restart, say) cuts the device off from control for
+    /// good. A panic in a handler still stops it.
+    async fn on_panic(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        err: PanicError,
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
+        if err.reason() == PanicReason::OnMessage {
+            tracing::debug!(error = %err, "dropped a told message the registry could not forward");
+            return Ok(ControlFlow::Continue(()));
+        }
+
+        Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
     }
 }
 
@@ -418,5 +438,38 @@ where
         let result = ctx.try_forward(&aref, msg.message);
 
         RegistryForward::Forwarded(result)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[derive(kameo::Actor)]
+    struct Echo;
+
+    struct Ping;
+
+    impl Message<Ping> for Echo {
+        type Reply = ();
+
+        async fn handle(&mut self, _msg: Ping, _ctx: &mut Context<Self, Self::Reply>) {}
+    }
+
+    #[tokio::test]
+    async fn a_told_forward_to_a_missing_actor_leaves_the_registry_running() {
+        let registry = Registry::spawn_default();
+
+        registry
+            .tell(Forward::<Echo, _>::new(None, Ping))
+            .await
+            .unwrap();
+
+        let echo = Echo::spawn(Echo);
+        registry.ask(Register::new(None, &echo)).await.unwrap();
+        let found = registry.ask(Lookup::<Echo>::new(None)).await.unwrap();
+
+        assert!(registry.is_alive());
+        assert_eq!(found.map(|x| x.id()), Some(echo.id()));
     }
 }
