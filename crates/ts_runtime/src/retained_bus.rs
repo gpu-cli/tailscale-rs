@@ -4,6 +4,8 @@ use core::{
 };
 use std::collections::HashMap;
 
+use tokio::sync::mpsc;
+
 use kameo::{
     actor::{ActorId, Recipient},
     message::{Context, Message},
@@ -75,7 +77,51 @@ where
     M: Send + 'static,
 {
     retained: Option<M>,
-    recipients: HashMap<ActorId, Recipient<M>>,
+    recipients: HashMap<ActorId, Subscriber<M>>,
+}
+
+/// A subscribed actor and the queue of messages on their way to it.
+///
+/// The bus hands messages to the queue and never waits on the actor's mailbox. Subscribers publish
+/// from their own handlers, so a bus that waited on a full subscriber mailbox while that
+/// subscriber waited on the full bus mailbox would stop every publisher for good. A task per
+/// subscriber delivers its queue in order.
+struct Subscriber<M>
+where
+    M: Send + 'static,
+{
+    recipient: Recipient<M>,
+    queue: mpsc::UnboundedSender<M>,
+}
+
+impl<M> Subscriber<M>
+where
+    M: Send + 'static,
+{
+    fn new(recipient: Recipient<M>) -> Self {
+        let (queue, mut rx) = mpsc::unbounded_channel::<M>();
+        let target = recipient.clone();
+
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                // The actor stopped; dropping the receiver tells the bus.
+                if target.tell(message).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Self { recipient, queue }
+    }
+
+    /// Queues `message`; false if the subscriber is gone.
+    fn send(&self, message: M) -> bool {
+        self.queue.send(message).is_ok()
+    }
+
+    fn is_alive(&self) -> bool {
+        self.recipient.is_alive() && !self.queue.is_closed()
+    }
 }
 
 impl<M> Default for SubState<M>
@@ -138,9 +184,9 @@ where
 
         let mut any_missing = false;
 
-        for recip in state.recipients.values_mut() {
+        for recip in state.recipients.values() {
             // actor is dead (this is an expected case)
-            if recip.tell(message.clone()).await.is_err() {
+            if !recip.send(message.clone()) {
                 any_missing = true;
             }
         }
@@ -175,14 +221,19 @@ where
     ) -> Self::Reply {
         let state = self.entry_or_default::<M>();
 
-        if let Some(retained) = &state.retained
-            && !state.recipients.contains_key(&recip.id())
-            && let Err(e) = recip.tell(retained.clone()).await
-        {
-            tracing::error!(error = %e);
+        if let Some(existing) = state.recipients.get(&recip.id()) {
+            return Some(existing.recipient.clone());
         }
 
-        state.recipients.insert(recip.id(), recip)
+        let subscriber = Subscriber::new(recip.clone());
+        if let Some(retained) = &state.retained
+            && !subscriber.send(retained.clone())
+        {
+            tracing::error!(id = ?recip.id(), "subscriber gone before its retained message");
+        }
+
+        state.recipients.insert(recip.id(), subscriber);
+        None
     }
 }
 
@@ -237,7 +288,7 @@ where
             return (None, None);
         };
 
-        let ret = state.recipients.remove(&actor_id);
+        let ret = state.recipients.remove(&actor_id).map(|s| s.recipient);
 
         let state = if state.recipients.is_empty() {
             self.remove::<M>().and_then(|state| state.retained)
@@ -316,5 +367,81 @@ mod test {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct Tick;
+
+    #[derive(Clone)]
+    struct Tock;
+
+    /// Publishes a [`Tock`] for every [`Tick`] it's sent, as subscribers that derive state do.
+    struct Relay {
+        bus: ActorRef<RetainedBus>,
+        seen: usize,
+        want: usize,
+        done: Option<oneshot::Sender<()>>,
+    }
+
+    impl kameo::Actor for Relay {
+        type Args = Self;
+        type Error = kameo::error::Infallible;
+
+        async fn on_start(args: Self, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(args)
+        }
+    }
+
+    impl Message<Tick> for Relay {
+        type Reply = ();
+
+        async fn handle(&mut self, _: Tick, _: &mut Context<Self, ()>) {
+            self.bus.tell(Publish::retained(Tock)).await.unwrap();
+            self.seen += 1;
+            if self.seen == self.want
+                && let Some(done) = self.done.take()
+            {
+                let _ = done.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_publishes_does_not_stall_the_bus() {
+        const TICKS: usize = 200;
+
+        let bus =
+            RetainedBus::spawn_with_mailbox(RetainedBus::default(), kameo::mailbox::bounded(1));
+        bus.wait_for_startup().await;
+
+        let (done, finished) = oneshot::channel();
+        let relay = Relay::spawn_with_mailbox(
+            Relay {
+                bus: bus.clone(),
+                seen: 0,
+                want: TICKS,
+                done: Some(done),
+            },
+            kameo::mailbox::bounded(1),
+        );
+        relay.wait_for_startup().await;
+        bus.ask(Register(relay.clone().recipient::<Tick>()))
+            .await
+            .unwrap();
+
+        let publisher = tokio::spawn({
+            let bus = bus.clone();
+            async move {
+                for _ in 0..TICKS {
+                    bus.tell(Publish::retained(Tick)).await.unwrap();
+                }
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), finished)
+            .await
+            .expect("bus and subscriber stalled each other")
+            .unwrap();
+        publisher.await.unwrap();
     }
 }
