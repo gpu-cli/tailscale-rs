@@ -75,8 +75,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         while let Ok(mut conn) = listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = [0u8; 4];
-                if conn.read_exact(&mut buf).await.is_ok() {
-                    let _ = conn.write_all(&buf).await;
+                if conn.read_exact(&mut buf).await.is_ok()
+                    && let Err(e) = conn.write_all(&buf).await
+                {
+                    tracing::warn!(error = %e, "echo failed");
                 }
             });
         }
