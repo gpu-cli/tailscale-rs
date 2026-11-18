@@ -115,9 +115,9 @@ impl Message<ActivePeers> for PathDiscoverer {
     type Reply = ();
 
     async fn handle(&mut self, msg: ActivePeers, ctx: &mut Context<Self, Self::Reply>) {
-        // Reconciled against the live workers, not the previous active set: the bus keeps only
-        // the newest active set for a subscriber that falls behind, so a worker may have seen its
-        // peer go inactive and stopped in a snapshot this actor never got.
+        // Reconciled against the live workers, not the previous active set, and only this actor
+        // stops them: the bus keeps only the newest active set for a subscriber that falls
+        // behind, so a worker deciding from its own snapshots could stop after a reactivation.
         self.workers.retain(|_, worker| worker.is_alive());
 
         let inactive = self
@@ -161,18 +161,19 @@ impl Message<ActivePeers> for PathDiscoverer {
             }
         }
 
-        let mut any_deleted = false;
-        for to_delete in self.active_peers.difference(&msg) {
-            // deletions are handled by the PeerPds themselves
-            any_deleted = any_deleted || self.best_paths.remove(to_delete).is_some();
-        }
-
-        if any_deleted {
+        if forget_departed(&mut self.best_paths, &msg) {
             self.publish_best_paths().await;
         }
 
         self.active_peers = msg;
     }
+}
+
+/// Drops the best path of every peer not in `active`; true if any was dropped.
+fn forget_departed(best_paths: &mut BestPathMap, active: &ActivePeers) -> bool {
+    let before = best_paths.len();
+    best_paths.retain(|peer, _| active.contains(peer));
+    best_paths.len() != before
 }
 
 impl Message<PeerBestPath> for PathDiscoverer {
@@ -460,7 +461,6 @@ impl kameo::Actor for PeerPd {
         (env, peer_id): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
-        env.subscribe::<ActivePeers>(&slf).await?;
         env.subscribe::<IncomingDiscoMsg>(&slf).await?;
         env.subscribe::<Arc<PeerState>>(&slf).await?;
         env.subscribe::<NewEndpoints>(&slf).await?;
@@ -567,17 +567,6 @@ impl Message<NewEndpoints> for PeerPd {
     }
 }
 
-impl Message<ActivePeers> for PeerPd {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: ActivePeers, ctx: &mut Context<Self, Self::Reply>) {
-        if !msg.contains(&self.peer_id) {
-            tracing::debug!(peer_id = %self.peer_id, "peer went inactive, stopping path discovery");
-            ctx.stop();
-        }
-    }
-}
-
 impl Message<IncomingDiscoMsg> for PeerPd {
     type Reply = ();
 
@@ -666,7 +655,7 @@ mod test {
         })
         .await;
 
-        // The worker saw the peer go inactive and stopped; the discoverer missed that snapshot.
+        // A worker that stopped for any reason is replaced on the next active set.
         let first = worker(&env, peer).await.unwrap();
         first.stop_gracefully().await.unwrap();
         first.wait_for_shutdown().await;
@@ -677,9 +666,41 @@ mod test {
         })
         .await;
 
+        // Inactive and active again in quick succession: the worker it ends with stays up.
+        pd.tell(active(&[])).await.unwrap();
+        pd.tell(active(&[peer])).await.unwrap();
+        eventually(
+            "the reactivated peer was left without a worker",
+            async || worker(&env, peer).await.is_some(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            worker(&env, peer).await.is_some(),
+            "the worker stopped after reactivation"
+        );
+
         // And the discoverer stops a worker whose peer went inactive, whatever the worker saw.
         let second = worker(&env, peer).await.unwrap();
         pd.tell(active(&[])).await.unwrap();
         eventually("a worker outlived its peer", async || !second.is_alive()).await;
+    }
+
+    #[test]
+    fn every_departed_peer_loses_its_best_path() {
+        let ep = |port| {
+            (
+                UnderlayTransportId(1),
+                DynEndpoint::udp(([192, 0, 2, 1], port).into()),
+            )
+        };
+        let mut paths = BestPathMap::new();
+        paths.insert(PeerId(1), ep(1));
+        paths.insert(PeerId(2), ep(2));
+        paths.insert(PeerId(3), ep(3));
+
+        assert!(forget_departed(&mut paths, &active(&[PeerId(3)])));
+        assert_eq!(paths.keys().copied().collect::<Vec<_>>(), [PeerId(3)]);
+        assert!(!forget_departed(&mut paths, &active(&[PeerId(3)])));
     }
 }

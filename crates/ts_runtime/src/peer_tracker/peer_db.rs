@@ -207,18 +207,15 @@ impl PeerDb {
             |x| &x.accepted_routes,
             &mut self.index_state,
             |old, idx| {
-                for &route in &old.accepted_routes {
+                for route in distinct_routes(&old.accepted_routes) {
                     idx.remove_route(route, id);
                 }
             },
             |new, idx| {
-                for &route in &new.accepted_routes {
+                for route in distinct_routes(&new.accepted_routes) {
                     idx.route_idx.modify(route, |val| {
-                        // A route listed twice, or two that name one prefix, index the peer once.
                         if let Some(val) = val {
-                            if !val.contains(&id) {
-                                val.push(id);
-                            }
+                            val.push(id);
                             return RouteModification::Noop;
                         }
 
@@ -320,8 +317,8 @@ impl IndexState {
             self.name_idx.remove(&fqdn);
         }
 
-        for route in &node.accepted_routes {
-            self.remove_route(*route, id);
+        for route in distinct_routes(&node.accepted_routes) {
+            self.remove_route(route, id);
         }
 
         if let Some(disco) = &node.disco_key
@@ -419,6 +416,12 @@ where
         }
         owner => tracing::warn!(?id, ?owner, ?key, what, "index entry not held by this peer"),
     }
+}
+
+/// A node's routes, each prefix once: a route listed twice, or two that name one prefix, index
+/// the node once.
+fn distinct_routes(routes: &[ipnet::IpNet]) -> std::collections::BTreeSet<ipnet::IpNet> {
+    routes.iter().map(ipnet::IpNet::trunc).collect()
 }
 
 /// Specialization of [`maybe_update`] to work on [`Index`].
