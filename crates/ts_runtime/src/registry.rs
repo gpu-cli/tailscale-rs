@@ -502,7 +502,7 @@ mod test {
         assert!(registry.is_alive());
         assert!(registry.ask(Lookup::<Stuck>::new(None)).await.is_ok());
 
-        drop(release.send(()));
+        release.send(()).unwrap();
     }
 
     #[tokio::test]
