@@ -286,11 +286,17 @@ impl PeerDb {
 
 impl IndexState {
     fn remove(&mut self, id: PeerId, node: &Node) {
-        self.nk_idx.remove(&node.node_key);
-        self.stableid_idx.remove(&node.stable_id);
-        self.control_idx.remove(&node.id);
-        self.ip_idx.remove(node.tailnet_address.ipv4.into());
-        self.ip_idx.remove(node.tailnet_address.ipv6.into());
+        remove_own(&mut self.nk_idx, &node.node_key, id, "node key");
+        remove_own(&mut self.stableid_idx, &node.stable_id, id, "stable id");
+        remove_own(&mut self.control_idx, &node.id, id, "control id");
+        for net in [
+            ipnet::IpNet::from(node.tailnet_address.ipv4),
+            ipnet::IpNet::from(node.tailnet_address.ipv6),
+        ] {
+            if self.ip_idx.lookup(net.addr()).is_some_and(|&x| x == id) {
+                self.ip_idx.remove(net);
+            }
+        }
 
         if self.name_idx.get(&node.hostname).is_some_and(|&x| x == id) {
             self.name_idx.remove(&node.hostname);
@@ -409,17 +415,16 @@ fn maybe_update_idx<T>(
     idx: &mut Index<T>,
     new_id: PeerId,
 ) where
-    T: Eq + Hash + Clone,
+    T: Eq + Hash + Clone + Debug,
 {
     maybe_update(
         new,
         old,
         &accessor,
         idx,
-        |old, idx| {
-            let old_id = idx.remove(accessor(old));
-            assert!(old_id.is_some_and(|old_id| old_id == new_id));
-        },
+        // One map update can hand a value to a new holder before it changes the old holder's; by
+        // then the entry is the new holder's and stays.
+        |old, idx| remove_own(idx, accessor(old), new_id, core::any::type_name::<T>()),
         |new, idx| {
             idx.insert(accessor(new).clone(), new_id);
         },
@@ -980,6 +985,50 @@ mod test {
         validate_indices(&db, &b, b_id);
 
         db.remove(&a_id).unwrap();
+        validate_indices(&db, &b, b_id);
+    }
+
+    #[test]
+    fn a_patch_with_the_zero_disco_key_drops_it_from_the_index() {
+        let mut node = rand_node();
+        let key = DiscoPublicKey::random();
+        node.disco_key = Some(key);
+
+        let mut db = PeerDb::default();
+        let id = db.upsert(&node);
+
+        assert_eq!(
+            db.patch(&disco_update(&node, DiscoPublicKey::from_bytes([0; 32]))),
+            Some(id)
+        );
+        node.disco_key = None;
+
+        assert_eq!(key.lookup(&db), None);
+        validate_indices(&db, &node, id);
+    }
+
+    #[test]
+    fn a_node_key_handed_on_before_its_holder_rotates_stays_with_the_new_holder() {
+        let mut a = rand_node();
+        let mut b = rand_node();
+        let mut db = PeerDb::default();
+        let a_id = db.upsert(&a);
+        let b_id = db.upsert(&b);
+
+        let rotated = NodePublicKey::random();
+        let key_update = |node: &Node, key: NodePublicKey| NodeUpdate {
+            id: node.id,
+            node_key: Some(key),
+            ..Default::default()
+        };
+
+        // One map update: `a` takes `b`'s key, then `b` moves to a fresh one.
+        assert_eq!(db.patch(&key_update(&a, b.node_key)), Some(a_id));
+        a.node_key = b.node_key;
+        assert_eq!(db.patch(&key_update(&b, rotated)), Some(b_id));
+        b.node_key = rotated;
+
+        validate_indices(&db, &a, a_id);
         validate_indices(&db, &b, b_id);
     }
 }
