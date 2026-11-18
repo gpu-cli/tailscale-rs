@@ -264,5 +264,8 @@ name = "tcp_echo"
 name = "pair_reach"
 
 [[example]]
+name = "churn_reach"
+
+[[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]
