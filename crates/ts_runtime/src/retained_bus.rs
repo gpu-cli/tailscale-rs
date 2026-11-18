@@ -571,6 +571,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stalled_subscriber_drops_unretained_messages_and_holds_up_no_one() {
         const TICKS: usize = 4 * UNRETAINED_QUEUE_LIMIT;
+        const BATCH: usize = UNRETAINED_QUEUE_LIMIT / 4;
 
         let bus = RetainedBus::spawn_default();
         bus.wait_for_startup().await;
@@ -589,17 +590,20 @@ mod test {
             .await
             .unwrap();
 
-        for _ in 0..TICKS {
-            bus.tell(Publish::unretained(Tick)).await.unwrap();
-        }
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while counter.ask(Count).await.unwrap() < TICKS {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // In batches the healthy subscriber keeps up with, so only the stalled one falls behind.
+        for batch in 1..=TICKS / BATCH {
+            for _ in 0..BATCH {
+                bus.tell(Publish::unretained(Tick)).await.unwrap();
             }
-        })
-        .await
-        .expect("a stalled subscriber held up another");
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while counter.ask(Count).await.unwrap() < batch * BATCH {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a stalled subscriber held up another");
+        }
 
         assert!(bus.ask(QueuedFor(stalled.id())).await.unwrap() <= UNRETAINED_QUEUE_LIMIT);
 
