@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use kameo::{
     Reply,
     actor::{ActorRef, Spawn, WeakActorRef},
-    error::{ActorStopReason, BoxSendError, Infallible, PanicError, SendError},
+    error::{ActorStopReason, BoxSendError, Infallible, PanicError, PanicReason, SendError},
     message::{Context, Message},
     reply::{BoxReplySender, DelegatedReply, ForwardedReply, ReplyError},
 };
@@ -117,9 +117,17 @@ impl kameo::Actor for Registry {
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        if err.reason().is_message_processing() {
-            tracing::warn!(error = %err, "registry dropped a message it could not handle");
-            return Ok(ControlFlow::Continue(()));
+        match err.reason() {
+            // A tell to an actor that's gone: routine while a device shuts down.
+            PanicReason::OnMessage => {
+                tracing::debug!(error = %err, "registry dropped a message for a missing actor");
+                return Ok(ControlFlow::Continue(()));
+            }
+            PanicReason::HandlerPanic => {
+                tracing::warn!(error = %err, "registry dropped a message it could not handle");
+                return Ok(ControlFlow::Continue(()));
+            }
+            _ => {}
         }
 
         Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
