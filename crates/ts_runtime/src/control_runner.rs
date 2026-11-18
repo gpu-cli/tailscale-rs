@@ -537,6 +537,16 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
             self.self_node = Some(node.clone());
         }
 
+        if let Some(derp) = &msg.derp
+            && let Err(e) = self
+                .params
+                .env
+                .publish(DerpMapUpdate(Arc::new(derp.clone())))
+                .await
+        {
+            tracing::error!(error = %e, "publishing derp map");
+        }
+
         // Ordered: a netmap update can be a delta, so none may be skipped. The wait is the map
         // stream's backpressure; no subscriber of it waits on this actor.
         if let Err(e) = self.params.env.publish_ordered(msg).await {
@@ -586,6 +596,11 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
         self.update_map_request(ctx).await;
     }
 }
+
+/// The newest DERP map from control, for actors that probe the network with it. They take it
+/// as a snapshot rather than from the ordered netmap updates, so a slow probe never holds those up.
+#[derive(Debug, Clone)]
+pub struct DerpMapUpdate(pub Arc<ts_control::DerpMap>);
 
 /// Control server dialer.
 pub struct DialerActor {

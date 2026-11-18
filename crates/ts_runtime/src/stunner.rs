@@ -1,6 +1,5 @@
 use std::{
     net::SocketAddr,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -78,7 +77,8 @@ impl kameo::Actor for Stunner {
     type Error = crate::Error;
 
     async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
-        env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
+        env.subscribe::<crate::control_runner::DerpMapUpdate>(&slf)
+            .await?;
 
         env.scheduler
             .tell(
@@ -108,18 +108,14 @@ impl Message<Tick> for Stunner {
     }
 }
 
-impl Message<Arc<ts_control::StateUpdate>> for Stunner {
+impl Message<crate::control_runner::DerpMapUpdate> for Stunner {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        state_update: Arc<ts_control::StateUpdate>,
+        crate::control_runner::DerpMapUpdate(derp_map): crate::control_runner::DerpMapUpdate,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let Some(derp_map) = &state_update.derp else {
-            return;
-        };
-
         let was_empty = self.servers.is_empty();
         self.servers.clear();
 

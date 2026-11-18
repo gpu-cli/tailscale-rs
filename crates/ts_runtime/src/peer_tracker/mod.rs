@@ -15,6 +15,8 @@ use crate::{Error, env::Env};
 mod peer_db;
 
 pub use peer_db::PeerDb;
+#[cfg(test)]
+pub(crate) use peer_db::test::rand_node as test_node;
 
 /// Actor that tracks peer delta updates and emits new states.
 pub struct PeerTracker {

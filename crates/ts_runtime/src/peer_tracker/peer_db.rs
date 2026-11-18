@@ -493,7 +493,7 @@ impl IndexedField for IpAddr {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -545,7 +545,7 @@ mod test {
         Ipv6Addr::from_segments(rng.random::<[u16; 8]>())
     }
 
-    fn rand_node() -> Node {
+    pub(crate) fn rand_node() -> Node {
         let mut rng = rand::rng();
 
         Node {

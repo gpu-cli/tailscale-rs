@@ -21,7 +21,7 @@ use crate::{
     Error, Task,
     env::Env,
     packetfilter::PacketFilterState,
-    peer_tracker::PeerState,
+    peer_tracker::{PeerDb, PeerState},
     route_updater::{PeerRouteUpdate, SelfRouteUpdate},
     src_filter::SourceFilterState,
 };
@@ -321,35 +321,144 @@ impl Message<Arc<PeerState>> for DataplaneActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: Arc<PeerState>, _ctx: &mut Context<Self, Self::Reply>) {
-        {
-            let mut dp = self.dataplane.inner().await;
-            let wg = &mut dp.wireguard;
-
-            // Reconciled against the whole peer db rather than the update's upserts and deletions:
-            // the bus keeps only the newest peer state for a subscriber that falls behind.
-            let want = msg
-                .peers
-                .iter()
-                .map(|(id, node)| (ts_tunnel::PeerId(id.0), node.node_key))
-                .collect::<HashMap<_, _>>();
-
-            // Removals first: a node key a removed peer held may now belong to another one.
-            self.wg_peers.retain(|id, key| {
-                let keep = want.get(id) == Some(key);
-                if !keep {
-                    wg.remove_peer(*id);
-                }
-                keep
-            });
-
-            for (id, key) in want {
-                if self.wg_peers.get(&id) != Some(&key) {
-                    wg.upsert_peer(ts_tunnel::PeerConfig::new(id, key, [0u8; 32]));
-                    self.wg_peers.insert(id, key);
-                }
-            }
+        // Worked out before taking the dataplane lock, which packets wait on; most peer updates
+        // change no WireGuard key.
+        let changes = WireguardChanges::new(&msg.peers, &self.wg_peers);
+        if changes.is_empty() {
+            return;
         }
 
+        changes.apply(
+            &mut self.dataplane.inner().await.wireguard,
+            &mut self.wg_peers,
+        );
+
         tracing::trace!("applied new peer state");
+    }
+}
+
+/// What brings WireGuard in line with the peer db.
+///
+/// It works from the whole db rather than an update's upserts and deletions: the bus keeps only
+/// the newest peer state for a subscriber that falls behind.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WireguardChanges {
+    remove: Vec<ts_tunnel::PeerId>,
+    upsert: Vec<(ts_tunnel::PeerId, ts_keys::NodePublicKey)>,
+}
+
+impl WireguardChanges {
+    fn new(db: &PeerDb, installed: &HashMap<ts_tunnel::PeerId, ts_keys::NodePublicKey>) -> Self {
+        // A node key goes to the peer the key index names: while a key is handed over, the db can
+        // briefly hold it on two records, and WireGuard keeps one peer per key.
+        let want = db
+            .iter()
+            .filter(|(id, node)| {
+                db.get(&node.node_key)
+                    .is_some_and(|(holder, _)| holder == *id)
+            })
+            .map(|(id, node)| (ts_tunnel::PeerId(id.0), node.node_key))
+            .collect::<HashMap<_, _>>();
+
+        let remove = installed
+            .iter()
+            .filter(|&(id, key)| want.get(id) != Some(key))
+            .map(|(&id, _)| id)
+            .collect();
+        let upsert = want
+            .into_iter()
+            .filter(|(id, key)| installed.get(id) != Some(key))
+            .collect();
+
+        Self { remove, upsert }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remove.is_empty() && self.upsert.is_empty()
+    }
+
+    fn apply(
+        self,
+        wg: &mut ts_tunnel::Endpoint,
+        installed: &mut HashMap<ts_tunnel::PeerId, ts_keys::NodePublicKey>,
+    ) {
+        // Removals first: a node key a removed peer held may now belong to another one.
+        for id in self.remove {
+            wg.remove_peer(id);
+            installed.remove(&id);
+        }
+
+        for (id, key) in self.upsert {
+            wg.upsert_peer(ts_tunnel::PeerConfig::new(id, key, [0u8; 32]));
+            installed.insert(id, key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use ts_control::NodeUpdate;
+    use ts_keys::{NodeKeyPair, NodePublicKey};
+
+    use super::*;
+    use crate::peer_tracker::test_node;
+
+    fn sync(
+        db: &PeerDb,
+        wg: &mut ts_tunnel::Endpoint,
+        installed: &mut HashMap<ts_tunnel::PeerId, NodePublicKey>,
+    ) {
+        WireguardChanges::new(db, installed).apply(wg, installed);
+        for (id, key) in installed.iter() {
+            assert_eq!(wg.peer_key(*id), Some(*key), "cached peer not installed");
+        }
+    }
+
+    #[test]
+    fn a_node_key_handed_over_stays_with_its_new_holder_after_the_old_one_goes() {
+        // The old code depended on hash order, so a run covers many orders.
+        for _ in 0..32 {
+            let mut wg = ts_tunnel::Endpoint::new(NodeKeyPair::random());
+            let mut installed = HashMap::new();
+
+            let old = test_node();
+            let new = test_node();
+            let mut db = PeerDb::default();
+            let old_id = db.upsert(&old);
+            let new_id = db.upsert(&new);
+            sync(&db, &mut wg, &mut installed);
+
+            // The new holder takes the key before control rotates or removes the old one.
+            db.patch(&NodeUpdate {
+                id: new.id,
+                node_key: Some(old.node_key),
+                ..Default::default()
+            });
+            sync(&db, &mut wg, &mut installed);
+            assert_eq!(wg.peer_id(old.node_key), Some(ts_tunnel::PeerId(new_id.0)));
+
+            db.remove(&old_id);
+            sync(&db, &mut wg, &mut installed);
+            assert_eq!(wg.peer_id(old.node_key), Some(ts_tunnel::PeerId(new_id.0)));
+            assert_eq!(wg.peer_key(ts_tunnel::PeerId(old_id.0)), None);
+        }
+    }
+
+    #[test]
+    fn an_update_that_changes_no_key_changes_nothing() {
+        let mut db = PeerDb::default();
+        let node = test_node();
+        db.upsert(&node);
+
+        let mut wg = ts_tunnel::Endpoint::new(NodeKeyPair::random());
+        let mut installed = HashMap::new();
+        sync(&db, &mut wg, &mut installed);
+
+        db.patch(&NodeUpdate {
+            id: node.id,
+            underlay_addresses: Some(vec!["192.0.2.1:41641".parse().unwrap()]),
+            ..Default::default()
+        });
+        assert!(WireguardChanges::new(&db, &installed).is_empty());
     }
 }

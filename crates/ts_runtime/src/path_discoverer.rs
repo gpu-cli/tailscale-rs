@@ -57,6 +57,8 @@ use crate::{
 pub struct PathDiscoverer {
     active_peers: ActivePeers,
     best_paths: BestPathMap,
+    /// The per-peer actor for each active peer.
+    workers: HashMap<PeerId, ActorRef<PeerPd>>,
     env: Env,
 }
 
@@ -84,6 +86,7 @@ impl kameo::Actor for PathDiscoverer {
             env,
             best_paths: Default::default(),
             active_peers: Default::default(),
+            workers: Default::default(),
         })
     }
 
@@ -112,7 +115,35 @@ impl Message<ActivePeers> for PathDiscoverer {
     type Reply = ();
 
     async fn handle(&mut self, msg: ActivePeers, ctx: &mut Context<Self, Self::Reply>) {
-        for &to_create in msg.difference(&self.active_peers) {
+        // Reconciled against the live workers, not the previous active set: the bus keeps only
+        // the newest active set for a subscriber that falls behind, so a worker may have seen its
+        // peer go inactive and stopped in a snapshot this actor never got.
+        self.workers.retain(|_, worker| worker.is_alive());
+
+        let inactive = self
+            .workers
+            .keys()
+            .filter(|id| !msg.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in inactive {
+            if let Some(worker) = self.workers.remove(&id) {
+                tracing::debug!(peer_id = ?id, "peer went inactive, stopping its path discovery");
+                // A graceful stop is a normal exit, so the supervisor does not restart it; sent from
+                // a task so a busy worker's mailbox never holds this actor up.
+                tokio::spawn(async move {
+                    if let Err(e) = worker.stop_gracefully().await {
+                        tracing::trace!(error = %e, "path discovery already stopped");
+                    }
+                });
+            }
+        }
+
+        for &to_create in msg.iter() {
+            if self.workers.contains_key(&to_create) {
+                continue;
+            }
+
             tracing::trace!(peer_id = ?to_create, "spawning actor for active peer");
 
             let aref = PeerPd::supervise(ctx.actor_ref(), (self.env.clone(), to_create))
@@ -120,7 +151,14 @@ impl Message<ActivePeers> for PathDiscoverer {
                 .spawn()
                 .await;
 
-            aref.wait_for_startup_result().await.unwrap();
+            match aref.wait_for_startup_result().await {
+                Ok(()) => {
+                    self.workers.insert(to_create, aref);
+                }
+                Err(e) => {
+                    tracing::error!(peer_id = ?to_create, error = %e, "starting path discovery")
+                }
+            }
         }
 
         let mut any_deleted = false;
@@ -582,5 +620,66 @@ impl Message<IncomingDiscoMsg> for PeerPd {
             latency: elapsed,
             transport: msg.transport,
         };
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use kameo::actor::Spawn;
+
+    use super::*;
+
+    async fn worker(env: &Env, peer: PeerId) -> Option<ActorRef<PeerPd>> {
+        env.lookup_opt::<PeerPd>(Some(PeerPd::actor_name(peer)))
+            .await
+            .unwrap()
+            .and_then(|weak| weak.upgrade())
+            .filter(|aref| aref.is_alive())
+    }
+
+    async fn eventually(what: &str, mut done: impl AsyncFnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done().await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect(what);
+    }
+
+    fn active(peers: &[PeerId]) -> ActivePeers {
+        Arc::new(peers.iter().copied().collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_active_again_gets_a_worker_after_a_missed_inactive_snapshot() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let pd = PathDiscoverer::spawn(env.clone());
+        pd.wait_for_startup_result().await.unwrap();
+        let peer = PeerId(7);
+
+        pd.tell(active(&[peer])).await.unwrap();
+        eventually("no worker for an active peer", async || {
+            worker(&env, peer).await.is_some()
+        })
+        .await;
+
+        // The worker saw the peer go inactive and stopped; the discoverer missed that snapshot.
+        let first = worker(&env, peer).await.unwrap();
+        first.stop_gracefully().await.unwrap();
+        first.wait_for_shutdown().await;
+
+        pd.tell(active(&[peer])).await.unwrap();
+        eventually("the active peer was left without a worker", async || {
+            worker(&env, peer).await.is_some()
+        })
+        .await;
+
+        // And the discoverer stops a worker whose peer went inactive, whatever the worker saw.
+        let second = worker(&env, peer).await.unwrap();
+        pd.tell(active(&[])).await.unwrap();
+        eventually("a worker outlived its peer", async || !second.is_alive()).await;
     }
 }

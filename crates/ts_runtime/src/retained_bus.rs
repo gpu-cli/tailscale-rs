@@ -129,6 +129,20 @@ enum Delivery {
     Latest,
 }
 
+/// The message to deliver when the slot's notification fires.
+///
+/// The queue may have filled since it was last seen empty, and everything in it is older than the
+/// slot's snapshot, so it goes first; the notification is re-armed so the slot follows.
+fn next_after_notify<M>(rx: &mut mpsc::Receiver<M>, latest: &Latest<M>) -> Option<M> {
+    match rx.try_recv() {
+        Ok(message) => {
+            latest.ready.notify_one();
+            Some(message)
+        }
+        Err(_) => latest.take(),
+    }
+}
+
 /// What became of a message handed to a [`Subscriber`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Queued {
@@ -159,7 +173,7 @@ where
                         Some(message) => message,
                         None => return,
                     },
-                    () = pending.ready.notified() => match pending.take() {
+                    () = pending.ready.notified() => match next_after_notify(&mut rx, &pending) {
                         Some(message) => message,
                         None => continue,
                     },
@@ -827,5 +841,31 @@ mod test {
             stalled.ask(Seen).await.unwrap(),
             (0..SENT).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn the_slot_waits_for_messages_queued_after_the_queue_was_seen_empty() {
+        let (queue, mut rx) = mpsc::channel(QUEUE_LIMIT);
+        let latest = Latest {
+            slot: Mutex::new(None),
+            ready: Notify::new(),
+        };
+
+        // As if the queue filled and a newer snapshot went to the slot between the delivery
+        // task seeing the queue empty and its notification firing.
+        queue.try_send(Seq(1)).unwrap();
+        queue.try_send(Seq(2)).unwrap();
+        *latest.slot.lock().unwrap() = Some(Seq(3));
+
+        let mut delivered = vec![];
+        while let Some(Seq(n)) = next_after_notify(&mut rx, &latest) {
+            delivered.push(n);
+        }
+        assert_eq!(delivered, [1, 2, 3]);
+
+        // Each queued message re-armed the notification, so the slot is not left behind.
+        tokio::time::timeout(Duration::from_secs(1), latest.ready.notified())
+            .await
+            .expect("notification not re-armed");
     }
 }
