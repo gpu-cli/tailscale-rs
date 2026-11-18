@@ -125,10 +125,11 @@ where
 
         if handle.is_finished()
             && let Err(e) = handle.detach().await
+            && e.is_panic()
         {
-            // The task was never canceled because it was still in the abort handle (the
-            // only way this particular task would be canceled), so the error must be due to
-            // a panic. Rethrow it here to make it appear as this actor's panic to kameo.
+            // Rethrow a panic here to make it appear as this actor's panic to kameo. The task
+            // can also have been cancelled, by its runtime shutting down while it was still in
+            // the abort handle; that is a normal end, not a panic.
             std::panic::resume_unwind(e.into_panic())
         }
 
@@ -242,5 +243,28 @@ mod test {
 
         let result = task.get_shutdown_result().unwrap().unwrap_err();
         assert!(matches!(result, HookError::Panicked(_)));
+    }
+
+    /// A runtime shutting down cancels the task while it is still in the abort handle; the
+    /// actor stops normally rather than panicking with "JoinError reason is not a panic".
+    #[tokio::test]
+    async fn a_cancelled_task_stops_without_panicking() {
+        use kameo::Actor;
+
+        let actor = Task::spawn(std::future::pending::<()>());
+        let inner = tokio::spawn(std::future::pending::<()>());
+        inner.abort();
+        while !inner.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut task = Task(Some(AbortOnDropHandle::new(inner)), PhantomData);
+        let stopped = task
+            .on_stop(actor.downgrade(), ActorStopReason::Normal)
+            .await;
+        assert!(stopped.is_ok());
+
+        actor.kill();
+        actor.wait_for_shutdown().await;
     }
 }

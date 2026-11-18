@@ -374,7 +374,11 @@ async fn write_to_overlay(slf: &CoreState, packets: HashMap<OverlayTransportId, 
     for (id, packets) in packets {
         if let Some(queue) = slf.overlay_transports.get(&id) {
             tracing::trace!(overlay_id = ?id, n_packets = packets.len(), "overlay packets");
-            queue.send(packets).unwrap();
+            // The transport's receiver is gone when it shuts down before the data plane does;
+            // its packets have nowhere to go.
+            if queue.send(packets).is_err() {
+                tracing::debug!(overlay_id = ?id, "overlay transport closed, packets dropped");
+            }
         }
     }
 }
@@ -383,8 +387,11 @@ async fn write_to_underlay(slf: &CoreState, packets: underlay_router::outbound::
     for ((tid, endpoint), packets) in packets {
         tracing::trace!(underlay_id = ?tid, ?endpoint, n_packets = packets.len(), "underlay data packets");
 
-        if let Some(queue) = slf.underlay_transports.get(&tid) {
-            queue.send((endpoint, packets)).unwrap();
+        if let Some(queue) = slf.underlay_transports.get(&tid)
+            && queue.send((endpoint, packets)).is_err()
+        {
+            // As for overlays: a transport that shut down first takes no more packets.
+            tracing::debug!(underlay_id = ?tid, "underlay transport closed, packets dropped");
         }
     }
 }
@@ -393,5 +400,30 @@ async fn option_sleep_until(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => core::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A transport whose receiver is gone (it shut down before the data plane) loses its
+    /// packets; the data plane carries on rather than panicking.
+    #[tokio::test]
+    async fn closed_transports_drop_packets() {
+        let (dp, _disco, _stun, _peers) = DataPlane::new(NodeKeyPair::random());
+        let (underlay, to_underlay, _) = dp.new_underlay_transport().await;
+        let (overlay, _, to_overlay) = dp.new_overlay_transport().await;
+        drop(to_underlay);
+        drop(to_overlay);
+
+        let state = dp.core_state.lock().await;
+        let endpoint = DynEndpoint::udp(([127, 0, 0, 1], 9).into());
+        write_to_underlay(
+            &state,
+            HashMap::from([((underlay, endpoint), vec![PacketMut::new(20)])]),
+        )
+        .await;
+        write_to_overlay(&state, HashMap::from([(overlay, vec![PacketMut::new(20)])])).await;
     }
 }
