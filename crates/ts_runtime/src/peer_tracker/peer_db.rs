@@ -188,7 +188,7 @@ impl PeerDb {
                     ipnet::IpNet::from(old.tailnet_address.ipv4),
                     ipnet::IpNet::from(old.tailnet_address.ipv6),
                 ] {
-                    if idx.lookup(net.addr()).is_some_and(|&x| x == id) {
+                    if idx.lookup_prefix_exact(net).is_some_and(|&x| x == id) {
                         idx.remove(net);
                     } else {
                         tracing::warn!(?id, %net, "tailnet address not indexed to this peer");
@@ -298,7 +298,11 @@ impl IndexState {
             ipnet::IpNet::from(node.tailnet_address.ipv4),
             ipnet::IpNet::from(node.tailnet_address.ipv6),
         ] {
-            if self.ip_idx.lookup(net.addr()).is_some_and(|&x| x == id) {
+            if self
+                .ip_idx
+                .lookup_prefix_exact(net)
+                .is_some_and(|&x| x == id)
+            {
                 self.ip_idx.remove(net);
             }
         }
@@ -1035,5 +1039,24 @@ mod test {
 
         validate_indices(&db, &a, a_id);
         validate_indices(&db, &b, b_id);
+    }
+
+    #[test]
+    fn a_removed_peers_prefix_goes_even_under_a_more_specific_one() {
+        let mut broad = rand_node();
+        broad.tailnet_address.ipv4 = "10.9.0.0/24".parse().unwrap();
+        let mut narrow = rand_node();
+        narrow.tailnet_address.ipv4 = "10.9.0.0/32".parse().unwrap();
+
+        let mut db = PeerDb::default();
+        let broad_id = db.upsert(&broad);
+        let narrow_id = db.upsert(&narrow);
+
+        let inside: IpAddr = "10.9.0.7".parse().unwrap();
+        assert_eq!(inside.lookup(&db), Some(broad_id));
+
+        db.remove(&broad_id);
+        assert_eq!(inside.lookup(&db), None);
+        validate_indices(&db, &narrow, narrow_id);
     }
 }
