@@ -16,6 +16,7 @@ use ts_transport::PeerId;
 use ts_tunnel::{Endpoint, NodeKeyPair};
 
 pub mod async_tokio;
+mod flows;
 pub mod overlay_router;
 mod packet_ident;
 pub mod underlay_router;
@@ -52,6 +53,9 @@ pub struct DataPlane {
     /// The packet filter.
     pub packet_filter: Arc<dyn ts_packetfilter::Filter + Send + Sync>,
 
+    /// Connections this node opened, whose return traffic the packet filter lets in.
+    flows: flows::Flows,
+
     /// Per-peer timestamps of last outgoing data packets.
     ///
     /// Used to determine whether we should be running path discovery for this peer.
@@ -78,6 +82,7 @@ impl DataPlane {
             or_in: Default::default(),
             events: Default::default(),
             packet_filter: Arc::new(ts_packetfilter::DropAllFilter),
+            flows: Default::default(),
             active_peers: Default::default(),
             wg_next: None,
             peer_gc_next: None,
@@ -113,12 +118,17 @@ impl DataPlane {
     /// Processes packets originating from the local device.
     #[tracing::instrument(skip_all, fields(n_packets = packets.len()))]
     pub fn process_outbound(&mut self, packets: Vec<PacketMut>) -> OutboundResult {
+        let now = Instant::now();
+        for packet in &packets {
+            if let Some((src, dst, transport)) = flows::classify(packet.as_ref()) {
+                self.flows.outbound(src, dst, transport, now);
+            }
+        }
+
         let overlay_router::outbound::Result {
             to_wireguard,
             loopback,
         } = self.or_out.route(packets);
-
-        let now = Instant::now();
 
         let to_wireguard = to_wireguard
             .into_iter()
@@ -210,6 +220,7 @@ impl DataPlane {
                 let _span =
                     tracing::trace_span!("packet_filter_inbound", n_packet = v.len()).entered();
 
+                let now = Instant::now();
                 v.retain(|pkt| {
                     let Ok(pkt) = etherparse::SlicedPacket::from_ip(pkt.as_ref()) else {
                         tracing::trace!("does not look like ip packet");
@@ -232,15 +243,27 @@ impl DataPlane {
                         }
                     };
 
-                    let (_src_port, dst_port) = match pkt.transport {
-                        Some(etherparse::TransportSlice::Udp(udp)) => {
-                            (udp.source_port(), udp.destination_port())
-                        }
-                        Some(etherparse::TransportSlice::Tcp(tcp)) => {
-                            (tcp.source_port(), tcp.destination_port())
-                        }
-                        _ => (0, 0),
+                    let (transport, dst_port) = match pkt.transport {
+                        Some(etherparse::TransportSlice::Udp(udp)) => (
+                            flows::Transport::Udp {
+                                src_port: udp.source_port(),
+                                dst_port: udp.destination_port(),
+                            },
+                            udp.destination_port(),
+                        ),
+                        Some(etherparse::TransportSlice::Tcp(tcp)) => (
+                            flows::Transport::Tcp {
+                                opening: tcp.syn() && !tcp.ack(),
+                            },
+                            tcp.destination_port(),
+                        ),
+                        _ => (flows::Transport::Other, 0),
                     };
+
+                    if self.flows.is_return(src, dst, transport, now) {
+                        tracing::trace!(?src, ?dst, ?transport, "return traffic");
+                        return true;
+                    }
 
                     let info = ts_packetfilter::PacketInfo {
                         ip_proto: proto,
