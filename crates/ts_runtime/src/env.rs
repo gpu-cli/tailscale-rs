@@ -76,7 +76,9 @@ impl Env {
 
         for queue in queues {
             // A closed queue is a subscriber that stopped; the bus drops it on its next publish.
-            let _ = queue.send(msg.clone()).await;
+            if queue.send(msg.clone()).await.is_err() {
+                tracing::trace!(msgty = core::any::type_name::<M>(), "subscriber gone");
+            }
         }
 
         Ok(())
