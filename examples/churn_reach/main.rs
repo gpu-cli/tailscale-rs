@@ -54,6 +54,26 @@ async fn reach(client: &Device, addr: SocketAddr) -> Result<Duration, String> {
     }
 }
 
+/// Whether `host` and `dev` have each other in their peer lists, to tell which side's view of
+/// the tailnet fell behind.
+async fn who_knows(host: &Device, dev: &Device) -> String {
+    let knows = async |a: &Device, b: &Device| -> String {
+        let Ok(ip) = b.ipv4_addr().await else {
+            return "no address".into();
+        };
+        match a.peer_by_tailnet_ip(ip.into()).await {
+            Ok(Some(_)) => "yes".into(),
+            Ok(None) => "no".into(),
+            Err(e) => format!("error: {e}"),
+        }
+    };
+    format!(
+        "host knows the device: {}, the device knows the host: {}",
+        knows(host, dev).await,
+        knows(dev, host).await
+    )
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
@@ -96,7 +116,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Ok(t) => tracing::info!(round, i, ?t, "group device reached the host"),
                 Err(e) => {
                     failures += 1;
-                    println!("round {round}: group device {i}: {e}");
+                    println!(
+                        "round {round}: group device {i}: {e}; {}",
+                        who_knows(&host, dev).await
+                    );
                 }
             }
         }
@@ -113,7 +136,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             Err(e) => {
                 failures += 1;
-                println!("round {round}: a device after the group left: {e}");
+                println!(
+                    "round {round}: a device after the group left: {e}; {}",
+                    who_knows(&host, &fresh).await
+                );
             }
         }
         fresh.shutdown(Some(Duration::from_secs(5))).await;
