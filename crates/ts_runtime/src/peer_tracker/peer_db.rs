@@ -214,8 +214,11 @@ impl PeerDb {
             |new, idx| {
                 for &route in &new.accepted_routes {
                     idx.route_idx.modify(route, |val| {
+                        // A route listed twice, or two that name one prefix, index the peer once.
                         if let Some(val) = val {
-                            val.push(id);
+                            if !val.contains(&id) {
+                                val.push(id);
+                            }
                             return RouteModification::Noop;
                         }
 
@@ -343,7 +346,9 @@ impl IndexState {
                     !ids_match
                 });
 
-                assert!(some_matched);
+                if !some_matched {
+                    tracing::warn!(?id, %route, "route not indexed to this peer");
+                }
 
                 if val.is_empty() {
                     RouteModification::Remove
@@ -1058,5 +1063,22 @@ pub(crate) mod test {
         db.remove(&broad_id);
         assert_eq!(inside.lookup(&db), None);
         validate_indices(&db, &narrow, narrow_id);
+    }
+
+    #[test]
+    fn a_route_listed_twice_is_indexed_once_and_removed_cleanly() {
+        let mut node = rand_node();
+        let route: ipnet::IpNet = "10.20.0.0/16".parse().unwrap();
+        node.accepted_routes = vec![route, route, "10.20.1.2/16".parse().unwrap()];
+
+        let mut db = PeerDb::default();
+        let id = db.upsert(&node);
+        assert_eq!(
+            db.get_route(route).map(|(x, _)| x).collect::<Vec<_>>(),
+            [id]
+        );
+
+        db.remove(&id);
+        assert_eq!(db.get_route(route).count(), 0);
     }
 }
