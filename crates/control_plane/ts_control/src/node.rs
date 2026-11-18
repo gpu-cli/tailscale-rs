@@ -358,7 +358,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
             node_key: value.key,
             node_key_expiry: value.key_expiry,
             machine_key: value.machine,
-            disco_key: value.disco_key,
+            disco_key: known_disco_key(value.disco_key),
             tailnet_lock_key_signature: value.key_signature.as_ref().map(|s| Vec::<u8>::from(*s)),
 
             accepted_routes: value
@@ -441,9 +441,34 @@ impl From<&ts_control_serde::PeerChange<'_>> for NodeUpdate {
             cap_map,
             node_key: value.key,
             node_key_expiry: value.key_expiry,
-            disco_key: value.disco_key,
+            disco_key: known_disco_key(value.disco_key),
             tailnet_lock_key_signature: value.key_signature.map(|x| x.into()),
             underlay_addresses: value.endpoints.clone(),
         }
+    }
+}
+
+/// A disco key control sent, unless it is the zero key.
+///
+/// Control sends the zero key for a node that has not reported a disco key yet. It is not a
+/// key: several such nodes would share it, and anything indexed by disco key would conflate them.
+fn known_disco_key(key: Option<DiscoPublicKey>) -> Option<DiscoPublicKey> {
+    key.filter(|k| *k != DiscoPublicKey::from_bytes([0; 32]))
+}
+
+#[cfg(test)]
+mod known_disco_key_tests {
+    use super::*;
+
+    #[test]
+    fn the_zero_disco_key_is_not_a_key() {
+        assert_eq!(
+            known_disco_key(Some(DiscoPublicKey::from_bytes([0; 32]))),
+            None
+        );
+
+        let key = DiscoPublicKey::random();
+        assert_eq!(known_disco_key(Some(key)), Some(key));
+        assert_eq!(known_disco_key(None), None);
     }
 }

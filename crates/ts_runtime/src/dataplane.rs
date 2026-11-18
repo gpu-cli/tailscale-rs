@@ -318,18 +318,22 @@ impl Message<Arc<PeerState>> for DataplaneActor {
             let mut dp = self.dataplane.inner().await;
             let wg = &mut dp.wireguard;
 
+            // Deletions first: a node key a deleted peer held may now belong to an upserted one.
+            for delete in &msg.deletions {
+                wg.remove_peer(ts_tunnel::PeerId(delete.0));
+            }
+
             for &upsert in &msg.upserts {
-                let (_, node) = msg.peers.get(&upsert).unwrap();
+                let Some((_, node)) = msg.peers.get(&upsert) else {
+                    tracing::error!(?upsert, "upserted peer missing from the peer db");
+                    continue;
+                };
 
                 wg.upsert_peer(ts_tunnel::PeerConfig::new(
                     ts_tunnel::PeerId(upsert.0),
                     node.node_key,
                     [0u8; 32],
                 ));
-            }
-
-            for delete in &msg.deletions {
-                wg.remove_peer(ts_tunnel::PeerId(delete.0));
             }
         }
 

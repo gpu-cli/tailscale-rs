@@ -87,7 +87,8 @@ impl PeerDb {
     /// The [`NodeUpdate::id`] field is used as the primary key to identify the node.
     pub fn patch(&mut self, update: &NodeUpdate) -> Option<PeerId> {
         let id = update.id.lookup(self)?;
-        let mut peer = self.peers.remove(&id).unwrap();
+        // Upsert against the stored node, so the indices drop what the update changes.
+        let mut peer = self.peers.get(&id)?.clone();
         peer.apply_update(update);
         Some(self.upsert(&peer))
     }
@@ -132,8 +133,7 @@ impl PeerDb {
             &mut self.index_state.disco_idx,
             |old, idx| {
                 if let Some(key) = &old.disco_key {
-                    let old_id = idx.remove(key);
-                    assert!(old_id.is_some_and(|old_id| old_id == id));
+                    remove_own(idx, key, id, "disco key");
                 }
             },
             |new, idx| {
@@ -166,8 +166,7 @@ impl PeerDb {
                 }
 
                 if let Some(fqdn) = old.fqdn_opt(false) {
-                    let removed_id = idx.remove(&fqdn);
-                    assert!(removed_id.is_some_and(|removed_id| removed_id == id));
+                    remove_own(idx, &fqdn, id, "fqdn");
                 }
             },
             |new, idx| {
@@ -185,11 +184,16 @@ impl PeerDb {
             |x| &x.tailnet_address,
             &mut self.index_state.ip_idx,
             |old, idx| {
-                let id4 = idx.remove(old.tailnet_address.ipv4.into());
-                let id6 = idx.remove(old.tailnet_address.ipv6.into());
-
-                assert!(id4.is_some_and(|old_id| old_id == id));
-                assert!(id6.is_some_and(|old_id| old_id == id));
+                for addr in [
+                    IpAddr::from(old.tailnet_address.ipv4),
+                    IpAddr::from(old.tailnet_address.ipv6),
+                ] {
+                    if idx.lookup(addr).is_some_and(|&x| x == id) {
+                        idx.remove(addr.into());
+                    } else {
+                        tracing::warn!(?id, %addr, "tailnet address not indexed to this peer");
+                    }
+                }
             },
             |new, idx| {
                 idx.insert(new.tailnet_address.ipv4.into(), id);
@@ -292,7 +296,9 @@ impl IndexState {
             self.name_idx.remove(&node.hostname);
         }
 
-        if let Some(fqdn) = node.fqdn_opt(false) {
+        if let Some(fqdn) = node.fqdn_opt(false)
+            && self.name_idx.get(&fqdn).is_some_and(|&x| x == id)
+        {
             self.name_idx.remove(&fqdn);
         }
 
@@ -300,7 +306,9 @@ impl IndexState {
             self.remove_route(*route, id);
         }
 
-        if let Some(disco) = &node.disco_key {
+        if let Some(disco) = &node.disco_key
+            && self.disco_idx.get(disco).is_some_and(|&x| x == id)
+        {
             self.disco_idx.remove(disco);
         }
     }
@@ -374,6 +382,23 @@ fn maybe_update<'n, T, Idx>(
     }
 
     insert(new, idx)
+}
+
+/// Removes `key` from `idx` if it belongs to `id`.
+///
+/// An entry held by another peer stays: that peer still has the value. Control's data is not
+/// trusted to keep these fields unique, and a peer database that panics stops tracking every
+/// peer, so a mismatch is logged, not asserted.
+fn remove_own<T>(idx: &mut Index<T>, key: &T, id: PeerId, what: &str)
+where
+    T: Eq + Hash + Debug,
+{
+    match idx.get(key) {
+        Some(&owner) if owner == id => {
+            idx.remove(key);
+        }
+        owner => tracing::warn!(?id, ?owner, ?key, what, "index entry not held by this peer"),
+    }
 }
 
 /// Specialization of [`maybe_update`] to work on [`Index`].
@@ -905,5 +930,56 @@ mod test {
             proptest::prop_assert!(db.peers.is_empty());
             proptest::prop_assert!(db.index_state.is_empty());
         }
+    }
+
+    fn disco_update(node: &Node, key: DiscoPublicKey) -> NodeUpdate {
+        NodeUpdate {
+            id: node.id,
+            disco_key: Some(key),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_patched_disco_key_replaces_the_old_one() {
+        let mut node = rand_node();
+        node.disco_key = Some(DiscoPublicKey::random());
+        let old_key = node.disco_key;
+
+        let mut db = PeerDb::default();
+        let id = db.upsert(&node);
+
+        let new_key = DiscoPublicKey::random();
+        assert_eq!(db.patch(&disco_update(&node, new_key)), Some(id));
+        node.disco_key = Some(new_key);
+
+        assert_eq!(old_key.and_then(|k| k.lookup(&db)), None);
+        validate_indices(&db, &node, id);
+
+        db.remove(&id).unwrap();
+        assert!(db.index_state.is_empty());
+    }
+
+    #[test]
+    fn a_disco_key_two_peers_claim_stays_with_the_later_one() {
+        let shared = DiscoPublicKey::random();
+        let mut a = rand_node();
+        let mut b = rand_node();
+        a.disco_key = Some(shared);
+        b.disco_key = Some(shared);
+
+        let mut db = PeerDb::default();
+        let a_id = db.upsert(&a);
+        let b_id = db.upsert(&b);
+
+        let a_key = DiscoPublicKey::random();
+        assert_eq!(db.patch(&disco_update(&a, a_key)), Some(a_id));
+        a.disco_key = Some(a_key);
+
+        validate_indices(&db, &a, a_id);
+        validate_indices(&db, &b, b_id);
+
+        db.remove(&a_id).unwrap();
+        validate_indices(&db, &b, b_id);
     }
 }

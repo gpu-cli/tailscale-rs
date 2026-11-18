@@ -40,11 +40,16 @@ impl IdMap {
         true
     }
 
-    /// Delete the peer handle for the given key.
+    /// Delete the handle `key` maps to, if it is `id`'s.
     ///
-    /// Panics if there is no peer currently using that key.
-    pub fn remove_peer(&mut self, key: &NodePublicKey) {
-        self.node_keys.remove(key).unwrap();
+    /// Returns whether it was. Another peer's handle for the key stays.
+    pub fn remove_peer(&mut self, id: PeerId, key: &NodePublicKey) -> bool {
+        if self.node_keys.get(key) != Some(&id) {
+            return false;
+        }
+
+        self.node_keys.remove(key);
+        true
     }
 
     /// Allocate a new session ID for communication with the given peer.

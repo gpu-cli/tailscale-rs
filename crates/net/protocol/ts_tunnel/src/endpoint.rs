@@ -344,15 +344,21 @@ impl Endpoint {
     ///
     /// Returns the old [`PeerConfig`] if there was one.
     ///
-    /// # Panics
-    ///
-    /// If the [`NodePublicKey`] in the new [`PeerConfig`] collides with an existing key
-    /// for a different [`PeerId`].
+    /// A [`NodePublicKey`] names one peer. If another [`PeerId`] holds the new key, that peer is
+    /// removed: the caller's newest word on who holds a key wins, and a peer left holding it
+    /// would take the new peer's handshakes.
     pub fn upsert_peer(&mut self, mut cfg: PeerConfig) -> Option<PeerConfig> {
+        if let Some(holder) = self.state.ids.get_by_nodekey(&cfg.key)
+            && holder != cfg.id
+        {
+            tracing::warn!(?holder, new = ?cfg.id, "node key moved to another peer");
+            self.remove_peer(holder);
+        }
+
         match self.peers.get_mut(&cfg.id) {
             Some(peer) => {
                 if peer.config.key != cfg.key {
-                    self.state.ids.remove_peer(&peer.config.key);
+                    self.state.ids.remove_peer(cfg.id, &peer.config.key);
                     self.state.ids.add_peer(cfg.id, &cfg.key);
                 }
 
@@ -360,10 +366,7 @@ impl Endpoint {
                 Some(cfg)
             }
             None => {
-                if !self.state.ids.add_peer(cfg.id, &cfg.key) {
-                    panic!("nodekey collision");
-                }
-
+                self.state.ids.add_peer(cfg.id, &cfg.key);
                 self.peers.insert(cfg.id, Peer::from(cfg));
                 None
             }
@@ -378,7 +381,7 @@ impl Endpoint {
             None => false,
             Some(mut peer) => {
                 peer.shutdown();
-                self.state.ids.remove_peer(&peer.config.key);
+                self.state.ids.remove_peer(peer.config.id, &peer.config.key);
                 true
             }
         }
@@ -1115,5 +1118,40 @@ mod tests {
         // Only the latest sent packet survives, packet(1) and packet(2) are lost.
         assert_no_packets(&p.received_at_b);
         p.assert_received_at_a([packet(3)]);
+    }
+
+    #[test]
+    fn a_node_key_moving_to_another_peer_drops_the_old_peer() {
+        let mut ep = Endpoint::new(NodeKeyPair::random());
+        let key = NodeKeyPair::random().public;
+
+        assert!(
+            ep.upsert_peer(PeerConfig::new(PeerId(1), key, [0; 32]))
+                .is_none()
+        );
+        assert!(
+            ep.upsert_peer(PeerConfig::new(PeerId(2), key, [0; 32]))
+                .is_none()
+        );
+
+        assert_eq!(ep.state.ids.get_by_nodekey(&key), Some(PeerId(2)));
+        assert!(!ep.remove_peer(PeerId(1)));
+        assert!(ep.remove_peer(PeerId(2)));
+        assert_eq!(ep.state.ids.get_by_nodekey(&key), None);
+    }
+
+    #[test]
+    fn removing_a_peer_keeps_another_peers_key() {
+        let mut ep = Endpoint::new(NodeKeyPair::random());
+        let old = NodeKeyPair::random().public;
+        let new = NodeKeyPair::random().public;
+
+        ep.upsert_peer(PeerConfig::new(PeerId(1), old, [0; 32]));
+        ep.upsert_peer(PeerConfig::new(PeerId(1), new, [0; 32]));
+        ep.upsert_peer(PeerConfig::new(PeerId(2), old, [0; 32]));
+
+        assert!(ep.remove_peer(PeerId(1)));
+        assert_eq!(ep.state.ids.get_by_nodekey(&old), Some(PeerId(2)));
+        assert_eq!(ep.state.ids.get_by_nodekey(&new), None);
     }
 }
