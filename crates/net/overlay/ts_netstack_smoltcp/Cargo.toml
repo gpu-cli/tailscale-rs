@@ -20,6 +20,8 @@ futures-util = { workspace = true, features = ["async-await", "async-await-macro
 tracing.workspace = true
 flume.workspace = true
 heapless.workspace = true
+# A lock that works without std, for the per-stream send queue.
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 thiserror.workspace = true
 
 # Required dependencies for the "tokio" feature.
@@ -134,4 +136,8 @@ harness = false
 
 [[test]]
 name = "wrong_ip_version"
+required-features = ["tokio"]
+
+[[test]]
+name = "tcp_write"
 required-features = ["tokio"]

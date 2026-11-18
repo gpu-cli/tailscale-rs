@@ -5,7 +5,7 @@ use crate::netcore::{
     Netstack,
     command::{
         Error, Response,
-        tcp::stream::{Command as TcpStreamCommand, Response as TcpStreamResponse},
+        tcp::stream::{Command as TcpStreamCommand, Drained, Response as TcpStreamResponse},
     },
 };
 
@@ -100,17 +100,53 @@ impl Netstack {
                 }
             }
 
-            TcpStreamCommand::Close => {
+            TcpStreamCommand::Drain { queue, close } => {
                 let handle = handle.unwrap();
+                let socket_set = &mut self.socket_set;
 
-                let sock = self.socket_set.get_mut::<tcp::Socket>(handle);
-                sock.close();
+                // The socket is touched only while bytes are queued: those exist only
+                // while the stream does, so a drain that outlives it never reaches a
+                // closed (or reused) handle.
+                let left = queue.drain(|bytes| {
+                    let sock = socket_set.get_mut::<tcp::Socket>(handle);
+                    sock.send_slice(bytes)
+                        .map_err(|tcp::SendError::InvalidState| {
+                            tracing::error!(state = %sock.state(), "invalid socket state for send");
+                        })
+                });
 
-                self.pending_tcp_closes.push(handle);
+                match left {
+                    Drained::More => Response::WouldBlock {
+                        handle: Some(handle),
+                        command: TcpStreamCommand::Drain { queue, close }.into(),
+                    },
+                    Drained::Empty => {
+                        if close {
+                            self.close_tcp(handle);
+                        }
+                        Response::Ok
+                    }
+                    Drained::Failed => {
+                        if close {
+                            self.close_tcp(handle);
+                        }
+                        Response::Error(Error::invalid_socket_state())
+                    }
+                }
+            }
 
+            TcpStreamCommand::Close => {
+                self.close_tcp(handle.unwrap());
                 Response::Ok
             }
         }
+    }
+
+    fn close_tcp(&mut self, handle: SocketHandle) {
+        let sock = self.socket_set.get_mut::<tcp::Socket>(handle);
+        sock.close();
+
+        self.pending_tcp_closes.push(handle);
     }
 
     /// Drop all TCP sockets that have finished closing.
@@ -137,7 +173,11 @@ impl Netstack {
         match sock.state() {
             tcp::State::Established => {
                 tracing::trace!("connection succeeded");
-                TcpStreamResponse::Connected { handle }.into()
+                TcpStreamResponse::Connected {
+                    handle,
+                    send_buffer: self.config.tcp_buffer_size,
+                }
+                .into()
             }
 
             tcp::State::SynReceived | tcp::State::SynSent => Response::WouldBlock {

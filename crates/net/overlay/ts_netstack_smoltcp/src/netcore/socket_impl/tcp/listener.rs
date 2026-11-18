@@ -197,6 +197,7 @@ impl Netstack {
                     return TcpListenResponse::Accepted {
                         handle: accept,
                         remote: SocketAddr::new(remote.addr.into(), remote.port),
+                        send_buffer: self.config.tcp_buffer_size,
                     }
                     .into();
                 }

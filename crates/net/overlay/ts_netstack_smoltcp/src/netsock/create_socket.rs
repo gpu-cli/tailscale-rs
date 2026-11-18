@@ -137,13 +137,20 @@ where
             },
         )?;
 
-        try_response_as!(resp, tcp::stream::Response::Connected { handle });
+        try_response_as!(
+            resp,
+            tcp::stream::Response::Connected {
+                handle,
+                send_buffer
+            }
+        );
 
         Ok(TcpStream::new(
             self.command_channel(),
             handle,
             remote_endpoint,
             local_endpoint,
+            send_buffer,
         ))
     }
 
@@ -162,13 +169,20 @@ where
             )
             .await?;
 
-        try_response_as!(resp, tcp::stream::Response::Connected { handle });
+        try_response_as!(
+            resp,
+            tcp::stream::Response::Connected {
+                handle,
+                send_buffer
+            }
+        );
 
         Ok(TcpStream::new(
             self.command_channel(),
             handle,
             remote_endpoint,
             local_endpoint,
+            send_buffer,
         ))
     }
 

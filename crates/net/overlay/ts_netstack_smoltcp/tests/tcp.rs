@@ -71,7 +71,10 @@ fn listener_accepts_half_closed_connection() {
 
     // ...so when we call accept_blocking(), the listener sees the socket in CLOSE_WAIT.
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || tx.send(listener.accept_blocking()));
+    std::thread::spawn(move || {
+        // The test fails on its own timeout if nobody is listening.
+        drop(tx.send(listener.accept_blocking()));
+    });
     let conn = rx
         .recv_timeout(Duration::from_secs(1))
         .expect("accept() never returned the half-closed connection")

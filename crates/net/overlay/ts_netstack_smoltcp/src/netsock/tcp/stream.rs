@@ -1,6 +1,8 @@
+use alloc::sync::Arc;
 use core::{
     fmt::{Debug, Formatter},
     net::SocketAddr,
+    task::{Context, Poll},
 };
 
 use bytes::Bytes;
@@ -8,7 +10,10 @@ use smoltcp::iface::SocketHandle;
 
 use crate::{
     netcore,
-    netcore::{DisplayExt, HasChannel, Response, tcp},
+    netcore::{
+        DisplayExt, HasChannel, Request, Response, tcp,
+        tcp::stream::{Put, SendQueue},
+    },
     try_response_as,
 };
 
@@ -25,17 +30,25 @@ pub struct TcpStream {
 
     #[cfg(any(feature = "tokio", feature = "futures-io"))]
     read_fut: Option<PinBoxFut<Result<Bytes, netcore::Error>>>,
-    #[cfg(any(feature = "tokio", feature = "futures-io"))]
-    write_fut: Option<PinBoxFut<Result<usize, netcore::Error>>>,
+
+    /// What has been written and not yet moved into the socket.
+    queue: Arc<SendQueue>,
+    /// Where the answers to drain requests go: nowhere, as a write never waits for one.
+    unheard: flume::Sender<Response>,
+    /// A drain request waiting for room in a full command channel.
+    drain_request: Option<flume::r#async::SendFut<'static, Request>>,
 }
 
 impl TcpStream {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         sender: netcore::Channel,
         handle: SocketHandle,
         remote: SocketAddr,
         local: SocketAddr,
+        send_buffer: usize,
     ) -> Self {
+        let (unheard, _) = flume::bounded(1);
+
         Self {
             sender,
             handle,
@@ -45,8 +58,9 @@ impl TcpStream {
             #[cfg(any(feature = "tokio", feature = "futures-io"))]
             read_fut: None,
 
-            #[cfg(any(feature = "tokio", feature = "futures-io"))]
-            write_fut: None,
+            queue: Arc::new(SendQueue::new(send_buffer)),
+            unheard,
+            drain_request: None,
         }
     }
 }
@@ -81,32 +95,139 @@ impl TcpStream {
     /// Send bytes to the remote.
     ///
     /// Blocks until at least one byte can be queued. The return value is the number of
-    /// bytes actually sent.
+    /// bytes actually queued.
     pub fn send_blocking(&self, b: &[u8]) -> Result<usize, netcore::Error> {
-        let resp = self.request_blocking(tcp::stream::Command::Send {
-            buf: Bytes::copy_from_slice(b),
-        })?;
+        if b.is_empty() {
+            return Ok(0);
+        }
 
-        self._send(resp)
+        loop {
+            match self.queue.put(b, None) {
+                Put::Took { n, drain } => {
+                    if drain {
+                        let request = self.drain_request()?;
+                        if self.upgrade()?.send(request).is_err() {
+                            self.queue.drain_not_coming();
+                            return Err(netcore::ChannelClosedError.into());
+                        }
+                    }
+                    return Ok(n);
+                }
+                Put::Full => {
+                    // Wait for the queue to empty: a drain is under way, and this one is
+                    // answered when it is done.
+                    let resp = self.request_blocking(tcp::stream::Command::Drain {
+                        queue: self.queue.clone(),
+                        close: false,
+                    })?;
+                    match resp {
+                        Response::Ok => {}
+                        Response::Error(e) => return Err(e),
+                        _ => return Err(netcore::Error::wrong_type()),
+                    }
+                }
+                Put::Failed => return Err(netcore::Error::invalid_socket_state()),
+            }
+        }
     }
 
     /// Send bytes to the remote.
     ///
-    /// Blocks until at least one byte can be queued. The return value is the number of
-    /// bytes actually sent.
+    /// Waits until at least one byte can be queued. The return value is the number of
+    /// bytes actually queued.
     pub async fn send(&self, b: &[u8]) -> Result<usize, netcore::Error> {
-        let resp = self
-            .request(tcp::stream::Command::Send {
-                buf: Bytes::copy_from_slice(b),
-            })
-            .await?;
+        if b.is_empty() {
+            return Ok(0);
+        }
 
-        self._send(resp)
+        let (n, drain) = core::future::poll_fn(|cx| match self.queue.put(b, Some(cx.waker())) {
+            Put::Took { n, drain } => Poll::Ready(Ok((n, drain))),
+            Put::Full => Poll::Pending,
+            Put::Failed => Poll::Ready(Err(netcore::Error::invalid_socket_state())),
+        })
+        .await?;
+
+        if drain {
+            let request = self.drain_request()?;
+            if self.upgrade()?.send_async(request).await.is_err() {
+                self.queue.drain_not_coming();
+                return Err(netcore::ChannelClosedError.into());
+            }
+        }
+
+        Ok(n)
     }
 
-    fn _send(&self, resp: Response) -> Result<usize, netcore::Error> {
-        try_response_as!(resp, tcp::stream::Response::Sent { n });
-        Ok(n)
+    fn upgrade(&self) -> Result<flume::Sender<Request>, netcore::ChannelClosedError> {
+        self.sender.upgrade().ok_or(netcore::ChannelClosedError)
+    }
+
+    /// A request for the netstack to drain this stream's queue, answered to nobody.
+    fn drain_request(&self) -> Result<Request, netcore::ChannelClosedError> {
+        Ok(Request {
+            handle: Some(self.handle),
+            command: tcp::stream::Command::Drain {
+                queue: self.queue.clone(),
+                close: false,
+            }
+            .into(),
+            resp: self.unheard.clone(),
+            complete_if_channel_dropped: true,
+        })
+    }
+
+    /// Queue as much of `buf` as fits without waiting on the netstack: pending only while
+    /// the send buffer is full, and allocating nothing unless the command channel is.
+    fn poll_send(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, netcore::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // A drain request still waiting on the command channel; bytes may be queued
+        // behind it meanwhile, as it drains them too once sent.
+        if let Some(request) = self.drain_request.as_mut() {
+            match core::pin::Pin::new(request).poll(cx) {
+                Poll::Pending => {}
+                Poll::Ready(sent) => {
+                    self.drain_request = None;
+                    if sent.is_err() {
+                        self.queue.drain_not_coming();
+                        return Poll::Ready(Err(netcore::ChannelClosedError.into()));
+                    }
+                }
+            }
+        }
+
+        let n = match self.queue.put(buf, Some(cx.waker())) {
+            Put::Took { n, drain: false } => return Poll::Ready(Ok(n)),
+            Put::Took { n, drain: true } => n,
+            Put::Full => return Poll::Pending,
+            Put::Failed => return Poll::Ready(Err(netcore::Error::invalid_socket_state())),
+        };
+
+        let request = self.drain_request()?;
+        let sender = self.upgrade()?;
+        match sender.try_send(request) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(request)) => {
+                let mut waiting = sender.into_send_async(request);
+                if let Poll::Ready(Err(_)) = core::pin::Pin::new(&mut waiting).poll(cx) {
+                    self.queue.drain_not_coming();
+                    return Poll::Ready(Err(netcore::ChannelClosedError.into()));
+                }
+                self.drain_request = Some(waiting);
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                self.queue.drain_not_coming();
+                return Poll::Ready(Err(netcore::ChannelClosedError.into()));
+            }
+        }
+
+        Poll::Ready(Ok(n))
     }
 
     /// Receive bytes from the remote.
@@ -215,53 +336,19 @@ impl TcpStream {
         }
     }
 
-    #[cfg(any(feature = "tokio", feature = "futures-io"))]
-    fn poll_write(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-        buf: &[u8],
-    ) -> core::task::Poll<std::io::Result<usize>> {
-        use netcore::HasChannel;
-
-        let handle = self.handle;
-
-        loop {
-            match &mut self.write_fut {
-                None => {
-                    let b = Bytes::copy_from_slice(buf);
-                    let sender = self.sender.clone();
-
-                    let _ret = self.write_fut.insert(alloc::boxed::Box::pin(async move {
-                        let resp = sender
-                            .request(Some(handle), tcp::stream::Command::Send { buf: b })
-                            .await?;
-
-                        try_response_as!(resp, tcp::stream::Response::Sent { n });
-                        Ok(n)
-                    }));
-                }
-
-                Some(x) => {
-                    let poll_result = x.as_mut().poll(cx);
-                    let ret = core::task::ready!(poll_result)?;
-
-                    self.write_fut.take();
-
-                    break core::task::Poll::Ready(Ok(ret));
-                }
-            }
-        }
-    }
-
     socket_requestor_impl!();
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        if let Err(e) = self
-            .sender
-            .request_nonblocking(Some(self.handle), tcp::stream::Command::Close)
-        {
+        // Close once what was written is in the socket.
+        if let Err(e) = self.sender.request_nonblocking(
+            Some(self.handle),
+            tcp::stream::Command::Drain {
+                queue: self.queue.clone(),
+                close: true,
+            },
+        ) {
             tracing::warn!(err = %e, "possible socket leak");
         }
     }
@@ -280,14 +367,10 @@ impl std::io::Write for TcpStream {
         self.send_blocking(buf).map_err(netcore::Error::into)
     }
 
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        let mut buf = Bytes::copy_from_slice(buf);
-
+    fn write_all(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
         while !buf.is_empty() {
-            let resp = self.request_blocking(tcp::stream::Command::Send { buf: buf.clone() })?;
-            try_response_as!(resp, tcp::stream::Response::Sent { n });
-
-            let _consumed = buf.split_to(n);
+            let n = self.send_blocking(buf).map_err(std::io::Error::from)?;
+            buf = &buf[n..];
         }
 
         Ok(())
@@ -319,7 +402,9 @@ impl tokio::io::AsyncWrite for TcpStream {
         cx: &mut core::task::Context<'_>,
         buf: &[u8],
     ) -> core::task::Poll<std::io::Result<usize>> {
-        self.poll_write(cx, buf)
+        self.get_mut()
+            .poll_send(cx, buf)
+            .map_err(netcore::Error::into)
     }
 
     fn poll_flush(
@@ -360,7 +445,9 @@ impl futures_io::AsyncWrite for TcpStream {
         cx: &mut core::task::Context<'_>,
         buf: &[u8],
     ) -> core::task::Poll<std::io::Result<usize>> {
-        self.poll_write(cx, buf)
+        self.get_mut()
+            .poll_send(cx, buf)
+            .map_err(netcore::Error::into)
     }
 
     fn poll_flush(

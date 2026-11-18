@@ -52,6 +52,8 @@ pub enum Response {
         remote: SocketAddr,
         /// Handle of the new TCP connection.
         handle: SocketHandle,
+        /// How many bytes the stream may queue to send before a write waits.
+        send_buffer: usize,
     },
 }
 

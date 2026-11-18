@@ -59,13 +59,21 @@ impl TcpListener {
     }
 
     fn _accept(&self, response: Response) -> Result<TcpStream, netcore::Error> {
-        try_response_as!(response, tcp::listen::Response::Accepted { handle, remote });
+        try_response_as!(
+            response,
+            tcp::listen::Response::Accepted {
+                handle,
+                remote,
+                send_buffer
+            }
+        );
 
         Ok(TcpStream::new(
             self.sender.clone(),
             handle,
             remote,
             self.endpoint,
+            send_buffer,
         ))
     }
 
