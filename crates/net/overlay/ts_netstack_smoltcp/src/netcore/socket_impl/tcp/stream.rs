@@ -102,18 +102,22 @@ impl Netstack {
 
             TcpStreamCommand::Drain { queue, close } => {
                 let handle = handle.unwrap();
-                let socket_set = &mut self.socket_set;
+                let socket_set = core::cell::RefCell::new(&mut self.socket_set);
 
-                // The socket is touched only while bytes are queued: those exist only
-                // while the stream does, so a drain that outlives it never reaches a
-                // closed (or reused) handle.
-                let left = queue.drain(|bytes| {
-                    let sock = socket_set.get_mut::<tcp::Socket>(handle);
-                    sock.send_slice(bytes)
-                        .map_err(|tcp::SendError::InvalidState| {
-                            tracing::error!(state = %sock.state(), "invalid socket state for send");
-                        })
-                });
+                // The socket is touched only while bytes are queued or a writer waits:
+                // both exist only while the stream does, so a drain that outlives it
+                // never reaches a closed (or reused) handle.
+                let left = queue.drain(
+                    |bytes| {
+                        let mut set = socket_set.borrow_mut();
+                        let sock = set.get_mut::<tcp::Socket>(handle);
+                        sock.send_slice(bytes)
+                            .map_err(|tcp::SendError::InvalidState| {
+                                tracing::error!(state = %sock.state(), "invalid socket state for send");
+                            })
+                    },
+                    || socket_set.borrow().get::<tcp::Socket>(handle).send_queue(),
+                );
 
                 match left {
                     Drained::More => Response::WouldBlock {

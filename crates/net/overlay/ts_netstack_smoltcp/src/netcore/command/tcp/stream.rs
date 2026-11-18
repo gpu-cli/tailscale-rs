@@ -160,10 +160,12 @@ impl Debug for Response {
 
 /// The bytes a stream has written that the netstack has not yet moved into its socket.
 ///
-/// With the socket's own buffer this is the stream's send buffer: a write copies into it
-/// and returns at once, waiting only when it is full, so a write costs no allocation and
-/// no round trip through the netstack. The netstack drains it on a [`Command::Drain`],
-/// and again each time the socket frees room until it is empty.
+/// It and the socket's own buffer together hold at most the socket's send buffer: a
+/// write copies in what fits under that bound and returns at once, waiting only when
+/// it is full, so a write costs no allocation and no round trip through the netstack,
+/// and adds no queue the socket would not have had. The netstack drains it on a
+/// [`Command::Drain`], and again each time the socket frees room, until it is empty
+/// and no writer is waiting for room.
 ///
 /// The lock is a spin lock because the crate builds without std; it is held only to copy
 /// bytes in or out.
@@ -175,8 +177,11 @@ struct Ring {
     bytes: Vec<u8>,
     head: usize,
     len: usize,
-    /// A drain is on its way or under way: set by the write that finds the queue with
-    /// no drain coming, cleared by the drain that empties it.
+    /// What the socket held, unsent or unacknowledged, when the netstack last looked:
+    /// room here is what the send buffer has left after it.
+    in_socket: usize,
+    /// A drain is on its way or under way: set by the writer that finds none coming,
+    /// cleared by the drain that leaves nothing to do.
     draining: bool,
     /// The socket refused bytes: the connection is gone.
     failed: bool,
@@ -184,13 +189,24 @@ struct Ring {
     waker: Option<Waker>,
 }
 
+impl Ring {
+    fn room(&self) -> usize {
+        self.bytes.len().saturating_sub(self.len + self.in_socket)
+    }
+
+    /// Whether a writer must ask for a drain: none is coming. Marks one as coming.
+    fn ask(&mut self) -> bool {
+        !core::mem::replace(&mut self.draining, true)
+    }
+}
+
 /// What [`SendQueue::put`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Put {
-    /// Took `n` bytes; with `drain`, no drain is coming and the writer must ask for one.
+    /// Took `n` bytes.
     Took { n: usize, drain: bool },
     /// No room: the writer's waker, if given, is woken when there is.
-    Full,
+    Full { drain: bool },
     /// The connection is gone.
     Failed,
 }
@@ -198,22 +214,23 @@ pub(crate) enum Put {
 /// What [`SendQueue::drain`] left.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Drained {
-    /// Everything queued is in the socket.
+    /// Nothing queued, and no writer waiting for the socket to free room.
     Empty,
-    /// The socket is full; the rest waits for it to free room.
+    /// Bytes still queued, or a writer waiting for room the socket has not yet freed.
     More,
     /// The socket refused the bytes; what was queued is dropped.
     Failed,
 }
 
 impl SendQueue {
-    /// A queue that holds up to `capacity` bytes.
+    /// A queue for a socket whose send buffer holds `capacity` bytes.
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             ring: spin::mutex::SpinMutex::new(Ring {
                 bytes: vec![0; capacity.max(1)],
                 head: 0,
                 len: 0,
+                in_socket: 0,
                 draining: false,
                 failed: false,
                 waker: None,
@@ -221,14 +238,14 @@ impl SendQueue {
         }
     }
 
-    /// Copy as much of `bytes` in as fits.
+    /// Copy as much of `bytes` in as the send buffer has room for. With `drain`, no
+    /// drain is coming and the writer must ask for one.
     pub(crate) fn put(&self, bytes: &[u8], waker: Option<&Waker>) -> Put {
         let mut ring = self.ring.lock();
         if ring.failed {
             return Put::Failed;
         }
-        let capacity = ring.bytes.len();
-        let n = bytes.len().min(capacity - ring.len);
+        let n = bytes.len().min(ring.room());
         if n == 0 {
             if let Some(waker) = waker {
                 match &mut ring.waker {
@@ -236,51 +253,64 @@ impl SendQueue {
                     held => *held = Some(waker.clone()),
                 }
             }
-            return Put::Full;
+            // The room may be held by the socket alone: a drain watches it free.
+            return Put::Full { drain: ring.ask() };
         }
+        let capacity = ring.bytes.len();
         let tail = (ring.head + ring.len) % capacity;
         let first = n.min(capacity - tail);
         ring.bytes[tail..tail + first].copy_from_slice(&bytes[..first]);
         ring.bytes[..n - first].copy_from_slice(&bytes[first..n]);
         ring.len += n;
-        let drain = !core::mem::replace(&mut ring.draining, true);
-        Put::Took { n, drain }
+        Put::Took {
+            n,
+            drain: ring.ask(),
+        }
     }
 
     /// Hand the queued bytes, oldest first, to `send`, which takes what fits and says how
-    /// much, or fails if the connection is gone.
-    pub(crate) fn drain(&self, mut send: impl FnMut(&[u8]) -> Result<usize, ()>) -> Drained {
+    /// much, or fails if the connection is gone; then note what the socket holds, from
+    /// `in_socket`. Neither is called while nothing is queued and no writer waits.
+    pub(crate) fn drain(
+        &self,
+        mut send: impl FnMut(&[u8]) -> Result<usize, ()>,
+        mut in_socket: impl FnMut() -> usize,
+    ) -> Drained {
         let mut ring = self.ring.lock();
+        if ring.len == 0 && ring.waker.is_none() && !ring.failed {
+            ring.draining = false;
+            return Drained::Empty;
+        }
         let capacity = ring.bytes.len();
-        let mut moved = false;
-        while ring.len > 0 {
+        while ring.len > 0 && !ring.failed {
             let end = capacity.min(ring.head + ring.len);
             match send(&ring.bytes[ring.head..end]) {
                 Ok(0) => break,
                 Ok(n) => {
                     ring.head = (ring.head + n) % capacity;
                     ring.len -= n;
-                    moved = true;
                 }
                 Err(()) => {
                     ring.failed = true;
                     ring.len = 0;
-                    break;
                 }
             }
         }
+        if !ring.failed {
+            ring.in_socket = in_socket();
+        }
+        let waker = if ring.failed || ring.room() > 0 {
+            ring.waker.take()
+        } else {
+            None
+        };
         let left = if ring.failed {
             Drained::Failed
-        } else if ring.len == 0 {
+        } else if ring.len == 0 && ring.waker.is_none() {
             ring.draining = false;
             Drained::Empty
         } else {
             Drained::More
-        };
-        let waker = if moved || ring.failed {
-            ring.waker.take()
-        } else {
-            None
         };
         drop(ring);
         if let Some(waker) = waker {
@@ -293,6 +323,12 @@ impl SendQueue {
     pub(crate) fn drain_not_coming(&self) {
         self.ring.lock().draining = false;
     }
+
+    /// Forget the waiting writer: the stream is going, and a drain must not keep
+    /// watching a socket for it.
+    pub(crate) fn writer_gone(&self) {
+        self.ring.lock().waker = None;
+    }
 }
 
 #[cfg(test)]
@@ -304,7 +340,7 @@ mod tests {
         let queue = SendQueue::new(8);
         assert_eq!(queue.put(b"hello", None), Put::Took { n: 5, drain: true });
         assert_eq!(queue.put(b"world", None), Put::Took { n: 3, drain: false });
-        assert_eq!(queue.put(b"!", None), Put::Full);
+        assert_eq!(queue.put(b"!", None), Put::Full { drain: false });
     }
 
     #[test]
@@ -314,18 +350,24 @@ mod tests {
         let mut sent = Vec::new();
         // The socket has room for four bytes.
         let mut room = 4;
-        let left = queue.drain(|bytes| {
-            let n = bytes.len().min(room);
-            room -= n;
-            sent.extend_from_slice(&bytes[..n]);
-            Ok(n)
-        });
+        let left = queue.drain(
+            |bytes| {
+                let n = bytes.len().min(room);
+                room -= n;
+                sent.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            },
+            || 0,
+        );
         assert_eq!(left, Drained::More);
         assert_eq!(queue.put(b"ghijk", None), Put::Took { n: 5, drain: false });
-        let left = queue.drain(|bytes| {
-            sent.extend_from_slice(bytes);
-            Ok(bytes.len())
-        });
+        let left = queue.drain(
+            |bytes| {
+                sent.extend_from_slice(bytes);
+                Ok(bytes.len())
+            },
+            || 0,
+        );
         assert_eq!(left, Drained::Empty);
         assert_eq!(sent, b"abcdefghijk");
         assert_eq!(queue.put(b"l", None), Put::Took { n: 1, drain: true });
@@ -335,7 +377,35 @@ mod tests {
     fn a_refused_send_fails_the_queue() {
         let queue = SendQueue::new(8);
         queue.put(b"abc", None);
-        assert_eq!(queue.drain(|_| Err(())), Drained::Failed);
+        assert_eq!(queue.drain(|_| Err(()), || 0), Drained::Failed);
         assert_eq!(queue.put(b"d", None), Put::Failed);
+    }
+
+    #[test]
+    fn the_queue_and_the_socket_together_hold_no_more_than_the_send_buffer() {
+        let queue = SendQueue::new(8);
+        assert_eq!(queue.put(b"abcdef", None), Put::Took { n: 6, drain: true });
+        // The socket takes all six and is still holding them.
+        assert_eq!(queue.drain(|bytes| Ok(bytes.len()), || 6), Drained::Empty);
+        assert_eq!(queue.put(b"ghij", None), Put::Took { n: 2, drain: true });
+        assert_eq!(queue.drain(|_| Ok(0), || 8), Drained::More);
+
+        // A writer waits on the socket alone; the drain wakes it once the socket frees.
+        let woken = alloc::sync::Arc::new(Woken(core::sync::atomic::AtomicBool::new(false)));
+        let waker = Waker::from(woken.clone());
+        assert_eq!(queue.put(b"k", Some(&waker)), Put::Full { drain: false });
+        assert_eq!(queue.drain(|bytes| Ok(bytes.len()), || 8), Drained::More);
+        assert!(!woken.0.load(core::sync::atomic::Ordering::SeqCst));
+        assert_eq!(queue.drain(|bytes| Ok(bytes.len()), || 3), Drained::Empty);
+        assert!(woken.0.load(core::sync::atomic::Ordering::SeqCst));
+        assert_eq!(queue.put(b"klmnop", None), Put::Took { n: 5, drain: true });
+    }
+
+    struct Woken(core::sync::atomic::AtomicBool);
+
+    impl alloc::task::Wake for Woken {
+        fn wake(self: alloc::sync::Arc<Self>) {
+            self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
     }
 }

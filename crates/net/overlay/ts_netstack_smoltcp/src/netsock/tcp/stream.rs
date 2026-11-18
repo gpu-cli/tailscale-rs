@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::{
     fmt::{Debug, Formatter},
     net::SocketAddr,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::Bytes;
@@ -102,7 +102,9 @@ impl TcpStream {
         }
 
         loop {
-            match self.queue.put(b, None) {
+            // A blocked caller is woken by the answer below, not by a waker; one is
+            // still registered so a drain keeps watching the socket for room.
+            match self.queue.put(b, Some(Waker::noop())) {
                 Put::Took { n, drain } => {
                     if drain {
                         let request = self.drain_request()?;
@@ -113,9 +115,9 @@ impl TcpStream {
                     }
                     return Ok(n);
                 }
-                Put::Full => {
-                    // Wait for the queue to empty: a drain is under way, and this one is
-                    // answered when it is done.
+                Put::Full { .. } => {
+                    // Wait for room: this drain is answered once nothing is queued and
+                    // the socket has freed some.
                     let resp = self.request_blocking(tcp::stream::Command::Drain {
                         queue: self.queue.clone(),
                         close: false,
@@ -142,7 +144,20 @@ impl TcpStream {
 
         let (n, drain) = core::future::poll_fn(|cx| match self.queue.put(b, Some(cx.waker())) {
             Put::Took { n, drain } => Poll::Ready(Ok((n, drain))),
-            Put::Full => Poll::Pending,
+            Put::Full { drain: false } => Poll::Pending,
+            Put::Full { drain: true } => {
+                // A drain must watch the socket free room; with the command channel
+                // full, try again shortly.
+                match self.try_request_drain() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.queue.drain_not_coming();
+                        cx.waker().wake_by_ref();
+                    }
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+                Poll::Pending
+            }
             Put::Failed => Poll::Ready(Err(netcore::Error::invalid_socket_state())),
         })
         .await?;
@@ -156,6 +171,18 @@ impl TcpStream {
         }
 
         Ok(n)
+    }
+
+    /// Ask for a drain without waiting: false when the command channel is full.
+    fn try_request_drain(&self) -> Result<bool, netcore::Error> {
+        match self.upgrade()?.try_send(self.drain_request()?) {
+            Ok(()) => Ok(true),
+            Err(flume::TrySendError::Full(_)) => Ok(false),
+            Err(flume::TrySendError::Disconnected(_)) => {
+                self.queue.drain_not_coming();
+                Err(netcore::ChannelClosedError.into())
+            }
+        }
     }
 
     fn upgrade(&self) -> Result<flume::Sender<Request>, netcore::ChannelClosedError> {
@@ -189,45 +216,61 @@ impl TcpStream {
 
         // A drain request still waiting on the command channel; bytes may be queued
         // behind it meanwhile, as it drains them too once sent.
-        if let Some(request) = self.drain_request.as_mut() {
-            match core::pin::Pin::new(request).poll(cx) {
-                Poll::Pending => {}
-                Poll::Ready(sent) => {
-                    self.drain_request = None;
-                    if sent.is_err() {
-                        self.queue.drain_not_coming();
-                        return Poll::Ready(Err(netcore::ChannelClosedError.into()));
-                    }
-                }
-            }
+        if let Poll::Ready(Err(e)) = self.poll_handed_over(cx) {
+            return Poll::Ready(Err(e));
         }
 
-        let n = match self.queue.put(buf, Some(cx.waker())) {
-            Put::Took { n, drain: false } => return Poll::Ready(Ok(n)),
-            Put::Took { n, drain: true } => n,
-            Put::Full => return Poll::Pending,
+        let (taken, drain) = match self.queue.put(buf, Some(cx.waker())) {
+            Put::Took { n, drain } => (Some(n), drain),
+            Put::Full { drain } => (None, drain),
             Put::Failed => return Poll::Ready(Err(netcore::Error::invalid_socket_state())),
         };
+        if drain {
+            self.request_drain(cx)?;
+        }
 
+        match taken {
+            Some(n) => Poll::Ready(Ok(n)),
+            None => Poll::Pending,
+        }
+    }
+
+    /// Ask the netstack to drain the queue, keeping the request on the stream when the
+    /// command channel is full; the channel takes it from there once it has room.
+    fn request_drain(&mut self, cx: &mut Context<'_>) -> Result<(), netcore::Error> {
         let request = self.drain_request()?;
         let sender = self.upgrade()?;
         match sender.try_send(request) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(flume::TrySendError::Full(request)) => {
                 let mut waiting = sender.into_send_async(request);
                 if let Poll::Ready(Err(_)) = core::pin::Pin::new(&mut waiting).poll(cx) {
                     self.queue.drain_not_coming();
-                    return Poll::Ready(Err(netcore::ChannelClosedError.into()));
+                    return Err(netcore::ChannelClosedError.into());
                 }
                 self.drain_request = Some(waiting);
+                Ok(())
             }
             Err(flume::TrySendError::Disconnected(_)) => {
                 self.queue.drain_not_coming();
-                return Poll::Ready(Err(netcore::ChannelClosedError.into()));
+                Err(netcore::ChannelClosedError.into())
             }
         }
+    }
 
-        Poll::Ready(Ok(n))
+    /// Ready once a drain request held on the stream is with the netstack, which then
+    /// moves everything written into the socket.
+    fn poll_handed_over(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), netcore::Error>> {
+        let Some(request) = self.drain_request.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        let sent = core::task::ready!(core::pin::Pin::new(request).poll(cx));
+        self.drain_request = None;
+        if sent.is_err() {
+            self.queue.drain_not_coming();
+            return Poll::Ready(Err(netcore::ChannelClosedError.into()));
+        }
+        Poll::Ready(Ok(()))
     }
 
     /// Receive bytes from the remote.
@@ -342,6 +385,7 @@ impl TcpStream {
 impl Drop for TcpStream {
     fn drop(&mut self) {
         // Close once what was written is in the socket.
+        self.queue.writer_gone();
         if let Err(e) = self.sender.request_nonblocking(
             Some(self.handle),
             tcp::stream::Command::Drain {
@@ -409,9 +453,11 @@ impl tokio::io::AsyncWrite for TcpStream {
 
     fn poll_flush(
         self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<std::io::Result<()>> {
-        core::task::Poll::Ready(Ok(()))
+        self.get_mut()
+            .poll_handed_over(cx)
+            .map_err(netcore::Error::into)
     }
 
     fn poll_shutdown(
@@ -452,9 +498,11 @@ impl futures_io::AsyncWrite for TcpStream {
 
     fn poll_flush(
         self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<std::io::Result<()>> {
-        core::task::Poll::Ready(Ok(()))
+        self.get_mut()
+            .poll_handed_over(cx)
+            .map_err(netcore::Error::into)
     }
 
     fn poll_close(
