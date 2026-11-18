@@ -28,7 +28,7 @@ use std::{
 };
 
 use kameo::{
-    actor::{ActorRef, Spawn, WeakActorRef},
+    actor::{ActorId, ActorRef, Spawn, WeakActorRef},
     error::ActorStopReason,
     message::{Context, Message},
     supervision::RestartPolicy,
@@ -71,6 +71,9 @@ pub struct BestPaths(pub Arc<BestPathMap>);
 struct PeerBestPath {
     peer: PeerId,
     ep: Option<(UnderlayTransportId, DynEndpoint)>,
+    /// The worker that measured it; a report from one the discoverer has since replaced is
+    /// stale and ignored.
+    from: ActorId,
 }
 
 impl kameo::Actor for PathDiscoverer {
@@ -181,9 +184,14 @@ impl Message<PeerBestPath> for PathDiscoverer {
 
     async fn handle(
         &mut self,
-        PeerBestPath { peer, ep }: PeerBestPath,
+        PeerBestPath { peer, ep, from }: PeerBestPath,
         _ctx: &mut Context<Self, Self::Reply>,
     ) {
+        if self.workers.get(&peer).map(|worker| worker.id()) != Some(from) {
+            tracing::trace!(peer_id = ?peer, "dropping a best path from a retired worker");
+            return;
+        }
+
         let changed = match ep {
             Some(ep) => {
                 let ret = self.best_paths.insert(peer, ep.clone());
@@ -240,6 +248,9 @@ struct PeerPd {
     /// to `true` (preventing anything other than the scheduled probe intervals from triggering
     /// probes).
     started_probing: bool,
+
+    /// This actor's id, which its best-path reports carry.
+    id: ActorId,
 
     /// Records for current-generation probes (in-flight, or newly succeeded).
     current_probes: HashMap<DynEndpoint, ProbeState>,
@@ -329,6 +340,7 @@ impl PeerPd {
             self.env
                 .publish_noretain(PeerBestPath {
                     peer: self.peer_id,
+                    from: self.id,
                     ep: best.map(|((transport, ep), _latency)| (*transport, ep.clone())),
                 })
                 .await
@@ -478,6 +490,7 @@ impl kameo::Actor for PeerPd {
         Ok(Self {
             env,
             peer_id,
+            id: slf.id(),
             started_probing: false,
             previous_probe_latencies: Default::default(),
             this_node_endpoints: Default::default(),
@@ -702,5 +715,54 @@ mod test {
         assert!(forget_departed(&mut paths, &active(&[PeerId(3)])));
         assert_eq!(paths.keys().copied().collect::<Vec<_>>(), [PeerId(3)]);
         assert!(!forget_departed(&mut paths, &active(&[PeerId(3)])));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retired_workers_best_path_is_ignored() {
+        let env = Env::new(ts_keys::NodeState::generate());
+        let pd = PathDiscoverer::spawn(env.clone());
+        pd.wait_for_startup_result().await.unwrap();
+        let peer = PeerId(9);
+        let ep = (
+            UnderlayTransportId(1),
+            DynEndpoint::udp(([192, 0, 2, 9], 41641).into()),
+        );
+
+        pd.tell(active(&[peer])).await.unwrap();
+        eventually("no worker", async || worker(&env, peer).await.is_some()).await;
+        let retired = worker(&env, peer).await.unwrap().id();
+
+        // Inactive and active again: a new worker replaces the first.
+        pd.tell(active(&[])).await.unwrap();
+        pd.tell(active(&[peer])).await.unwrap();
+        eventually("no new worker", async || {
+            worker(&env, peer).await.is_some_and(|w| w.id() != retired)
+        })
+        .await;
+        let current = worker(&env, peer).await.unwrap().id();
+
+        let report = |from| PeerBestPath {
+            peer,
+            ep: Some(ep.clone()),
+            from,
+        };
+        pd.ask(report(retired)).await.unwrap();
+        assert!(
+            pd.ask(Paths).await.unwrap().is_empty(),
+            "a retired worker's path was kept"
+        );
+
+        pd.ask(report(current)).await.unwrap();
+        assert_eq!(pd.ask(Paths).await.unwrap().get(&peer), Some(&ep));
+    }
+
+    struct Paths;
+
+    impl Message<Paths> for PathDiscoverer {
+        type Reply = BestPathMap;
+
+        async fn handle(&mut self, _: Paths, _: &mut Context<Self, BestPathMap>) -> BestPathMap {
+            self.best_paths.clone()
+        }
     }
 }
