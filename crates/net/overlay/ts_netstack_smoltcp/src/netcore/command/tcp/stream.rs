@@ -270,11 +270,12 @@ impl SendQueue {
 
     /// Hand the queued bytes, oldest first, to `send`, which takes what fits and says how
     /// much, or fails if the connection is gone; then note what the socket holds, from
-    /// `in_socket`. Neither is called while nothing is queued and no writer waits.
+    /// `in_socket`, which is `None` once the socket can send no more. Neither is called
+    /// while nothing is queued and no writer waits.
     pub(crate) fn drain(
         &self,
         mut send: impl FnMut(&[u8]) -> Result<usize, ()>,
-        mut in_socket: impl FnMut() -> usize,
+        mut in_socket: impl FnMut() -> Option<usize>,
     ) -> Drained {
         let mut ring = self.ring.lock();
         if ring.len == 0 && ring.waker.is_none() && !ring.failed {
@@ -297,7 +298,15 @@ impl SendQueue {
             }
         }
         if !ring.failed {
-            ring.in_socket = in_socket();
+            match in_socket() {
+                Some(held) => ring.in_socket = held,
+                // Reset or closed: what it holds will never leave, so a writer waiting
+                // for room must hear it is gone.
+                None => {
+                    ring.failed = true;
+                    ring.len = 0;
+                }
+            }
         }
         let waker = if ring.failed || ring.room() > 0 {
             ring.waker.take()
@@ -357,7 +366,7 @@ mod tests {
                 sent.extend_from_slice(&bytes[..n]);
                 Ok(n)
             },
-            || 0,
+            || Some(0),
         );
         assert_eq!(left, Drained::More);
         assert_eq!(queue.put(b"ghijk", None), Put::Took { n: 5, drain: false });
@@ -366,7 +375,7 @@ mod tests {
                 sent.extend_from_slice(bytes);
                 Ok(bytes.len())
             },
-            || 0,
+            || Some(0),
         );
         assert_eq!(left, Drained::Empty);
         assert_eq!(sent, b"abcdefghijk");
@@ -377,7 +386,7 @@ mod tests {
     fn a_refused_send_fails_the_queue() {
         let queue = SendQueue::new(8);
         queue.put(b"abc", None);
-        assert_eq!(queue.drain(|_| Err(()), || 0), Drained::Failed);
+        assert_eq!(queue.drain(|_| Err(()), || Some(0)), Drained::Failed);
         assert_eq!(queue.put(b"d", None), Put::Failed);
     }
 
@@ -386,19 +395,47 @@ mod tests {
         let queue = SendQueue::new(8);
         assert_eq!(queue.put(b"abcdef", None), Put::Took { n: 6, drain: true });
         // The socket takes all six and is still holding them.
-        assert_eq!(queue.drain(|bytes| Ok(bytes.len()), || 6), Drained::Empty);
+        assert_eq!(
+            queue.drain(|bytes| Ok(bytes.len()), || Some(6)),
+            Drained::Empty
+        );
         assert_eq!(queue.put(b"ghij", None), Put::Took { n: 2, drain: true });
-        assert_eq!(queue.drain(|_| Ok(0), || 8), Drained::More);
+        assert_eq!(queue.drain(|_| Ok(0), || Some(8)), Drained::More);
 
         // A writer waits on the socket alone; the drain wakes it once the socket frees.
         let woken = alloc::sync::Arc::new(Woken(core::sync::atomic::AtomicBool::new(false)));
         let waker = Waker::from(woken.clone());
         assert_eq!(queue.put(b"k", Some(&waker)), Put::Full { drain: false });
-        assert_eq!(queue.drain(|bytes| Ok(bytes.len()), || 8), Drained::More);
+        assert_eq!(
+            queue.drain(|bytes| Ok(bytes.len()), || Some(8)),
+            Drained::More
+        );
         assert!(!woken.0.load(core::sync::atomic::Ordering::SeqCst));
-        assert_eq!(queue.drain(|bytes| Ok(bytes.len()), || 3), Drained::Empty);
+        assert_eq!(
+            queue.drain(|bytes| Ok(bytes.len()), || Some(3)),
+            Drained::Empty
+        );
         assert!(woken.0.load(core::sync::atomic::Ordering::SeqCst));
         assert_eq!(queue.put(b"klmnop", None), Put::Took { n: 5, drain: true });
+    }
+
+    #[test]
+    fn a_writer_waiting_on_a_socket_that_closed_hears_it_is_gone() {
+        let queue = SendQueue::new(8);
+        assert_eq!(
+            queue.put(b"abcdefgh", None),
+            Put::Took { n: 8, drain: true }
+        );
+        assert_eq!(
+            queue.drain(|bytes| Ok(bytes.len()), || Some(8)),
+            Drained::Empty
+        );
+        let woken = alloc::sync::Arc::new(Woken(core::sync::atomic::AtomicBool::new(false)));
+        let waker = Waker::from(woken.clone());
+        assert_eq!(queue.put(b"i", Some(&waker)), Put::Full { drain: true });
+        assert_eq!(queue.drain(|_| Ok(0), || None), Drained::Failed);
+        assert!(woken.0.load(core::sync::atomic::Ordering::SeqCst));
+        assert_eq!(queue.put(b"i", None), Put::Failed);
     }
 
     struct Woken(core::sync::atomic::AtomicBool);

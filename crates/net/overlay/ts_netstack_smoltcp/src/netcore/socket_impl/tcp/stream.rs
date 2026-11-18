@@ -116,7 +116,11 @@ impl Netstack {
                                 tracing::error!(state = %sock.state(), "invalid socket state for send");
                             })
                     },
-                    || socket_set.borrow().get::<tcp::Socket>(handle).send_queue(),
+                    || {
+                        let set = socket_set.borrow();
+                        let sock = set.get::<tcp::Socket>(handle);
+                        sock.may_send().then(|| sock.send_queue())
+                    },
                 );
 
                 match left {
