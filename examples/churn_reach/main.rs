@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::filter::LevelFilter;
 
 const PORT: u16 = 4747;
+const LOOKUP: Duration = Duration::from_secs(5);
 
 #[derive(clap::Parser)]
 struct Args {
@@ -32,8 +33,17 @@ async fn device(name: String, auth_key: Option<String>) -> Result<Device, Box<dy
 }
 
 /// Dials `addr` from `client` and checks an echo, retrying for up to 30 s.
+///
+/// Waits first for `client` to know the host, as an app that finds its peer by name does: a
+/// dial before the device's first netmap has no route.
 async fn reach(client: &Device, addr: SocketAddr) -> Result<Duration, String> {
     let start = tokio::time::Instant::now();
+    while !matches!(client.peer_by_tailnet_ip(addr.ip()).await, Ok(Some(_))) {
+        if start.elapsed() > Duration::from_secs(30) {
+            return Err(format!("{addr} not in the peer list within 30 s"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     loop {
         let attempt = async {
             let mut conn = client.tcp_connect(addr).await.map_err(|e| e.to_string())?;
@@ -58,13 +68,14 @@ async fn reach(client: &Device, addr: SocketAddr) -> Result<Duration, String> {
 /// the tailnet fell behind.
 async fn who_knows(host: &Device, dev: &Device) -> String {
     let knows = async |a: &Device, b: &Device| -> String {
-        let Ok(ip) = b.ipv4_addr().await else {
-            return "no address".into();
+        let Ok(Ok(ip)) = tokio::time::timeout(LOOKUP, b.ipv4_addr()).await else {
+            return "address lookup failed or hung".into();
         };
-        match a.peer_by_tailnet_ip(ip.into()).await {
-            Ok(Some(_)) => "yes".into(),
-            Ok(None) => "no".into(),
-            Err(e) => format!("error: {e}"),
+        match tokio::time::timeout(LOOKUP, a.peer_by_tailnet_ip(ip.into())).await {
+            Ok(Ok(Some(_))) => "yes".into(),
+            Ok(Ok(None)) => "no".into(),
+            Ok(Err(e)) => format!("error: {e}"),
+            Err(_) => "lookup hung".into(),
         }
     };
     format!(
