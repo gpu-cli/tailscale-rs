@@ -222,9 +222,11 @@ impl Node {
             self.derp_region = Some(derp_region);
         }
 
+        // An omitted key leaves the node's as it is; the zero key clears it, so messages under a
+        // key control has withdrawn are no longer accepted.
         if let Some(disco_key) = update.disco_key {
             tracing::debug!(old=?self.disco_key, new=?disco_key, "updating disco key");
-            self.disco_key = Some(disco_key);
+            self.disco_key = known_disco_key(Some(disco_key));
         }
 
         if let Some(node_key) = update.node_key {
@@ -441,7 +443,8 @@ impl From<&ts_control_serde::PeerChange<'_>> for NodeUpdate {
             cap_map,
             node_key: value.key,
             node_key_expiry: value.key_expiry,
-            disco_key: known_disco_key(value.disco_key),
+            // Kept as sent: in a patch the zero key clears the node's key (see `apply_update`).
+            disco_key: value.disco_key,
             tailnet_lock_key_signature: value.key_signature.map(|x| x.into()),
             underlay_addresses: value.endpoints.clone(),
         }
@@ -470,5 +473,53 @@ mod known_disco_key_tests {
         let key = DiscoPublicKey::random();
         assert_eq!(known_disco_key(Some(key)), Some(key));
         assert_eq!(known_disco_key(None), None);
+    }
+
+    fn test_node() -> Node {
+        Node {
+            id: 7,
+            stable_id: StableId("n7".into()),
+            hostname: "n7".into(),
+            capability_version: Default::default(),
+            status: NodeStatus::Unknown,
+            tailnet: None,
+            node_capabilities: Default::default(),
+            tags: vec![],
+            tailnet_address: TailnetAddress {
+                ipv4: "100.64.0.7/32".parse().unwrap(),
+                ipv6: "fd7a:115c:a1e0::7/128".parse().unwrap(),
+            },
+            node_key: NodePublicKey::random(),
+            node_key_expiry: None,
+            machine_key: None,
+            disco_key: None,
+            tailnet_lock_key_signature: None,
+            accepted_routes: vec![],
+            underlay_addresses: vec![],
+            derp_region: None,
+        }
+    }
+
+    fn patch(id: Id, disco_key: Option<DiscoPublicKey>) -> NodeUpdate {
+        NodeUpdate {
+            id,
+            disco_key,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_patch_with_the_zero_disco_key_clears_it_and_one_without_keeps_it() {
+        let key = DiscoPublicKey::random();
+        let mut node = Node {
+            disco_key: Some(key),
+            ..test_node()
+        };
+
+        node.apply_update(&patch(node.id, None));
+        assert_eq!(node.disco_key, Some(key));
+
+        node.apply_update(&patch(node.id, Some(DiscoPublicKey::from_bytes([0; 32]))));
+        assert_eq!(node.disco_key, None);
     }
 }
