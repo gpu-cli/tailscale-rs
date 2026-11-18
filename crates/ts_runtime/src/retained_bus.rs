@@ -406,7 +406,19 @@ mod test {
         }
     }
 
-    #[tokio::test]
+    /// Takes a while over each [`Tick`], as subscribers that probe the network do.
+    #[derive(kameo::Actor)]
+    struct Slow;
+
+    impl Message<Tick> for Slow {
+        type Reply = ();
+
+        async fn handle(&mut self, _: Tick, _: &mut Context<Self, ()>) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_subscriber_that_publishes_does_not_stall_the_bus() {
         const TICKS: usize = 200;
 
@@ -429,19 +441,29 @@ mod test {
             .await
             .unwrap();
 
-        let publisher = tokio::spawn({
-            let bus = bus.clone();
-            async move {
-                for _ in 0..TICKS {
-                    bus.tell(Publish::retained(Tick)).await.unwrap();
-                }
-            }
-        });
+        // While the bus waits on this one, publishers fill its mailbox, the relay blocks
+        // publishing and its own mailbox fills behind it.
+        let slow = Slow::spawn_with_mailbox(Slow, kameo::mailbox::bounded(1));
+        slow.wait_for_startup().await;
+        bus.ask(Register(slow.recipient::<Tick>())).await.unwrap();
+
+        let publishers = (0..2)
+            .map(|_| {
+                let bus = bus.clone();
+                tokio::spawn(async move {
+                    for _ in 0..TICKS / 2 {
+                        bus.tell(Publish::retained(Tick)).await.unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
 
         tokio::time::timeout(Duration::from_secs(10), finished)
             .await
             .expect("bus and subscriber stalled each other")
             .unwrap();
-        publisher.await.unwrap();
+        for publisher in publishers {
+            publisher.await.unwrap();
+        }
     }
 }
