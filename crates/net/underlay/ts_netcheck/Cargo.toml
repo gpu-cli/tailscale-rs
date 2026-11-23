@@ -26,6 +26,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+crc32fast = "1.5"
 proptest.workspace = true
 # The library the STUN codec replaced, kept as the reference its tests compare with.
 stun-rs = "0.1"

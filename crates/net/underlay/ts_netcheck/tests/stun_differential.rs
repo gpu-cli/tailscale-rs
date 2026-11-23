@@ -40,6 +40,37 @@ fn reference(packet: &[u8]) -> Option<(TransactionId, SocketAddr)> {
     Some((TransactionId(*msg.transaction_id().as_bytes()), addr))
 }
 
+/// `packet` with the value of every attribute the codec does not read made ASCII text,
+/// and a FINGERPRINT that held over the original taken again over the result. stun-rs
+/// refuses a SOFTWARE (or other text attribute) that is not UTF-8, which the codec never
+/// looks at; this is the same message to the codec, and one stun-rs can judge on what the
+/// codec does read.
+fn unread_as_text(packet: &[u8]) -> Vec<u8> {
+    const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+    const FINGERPRINT: u16 = 0x8028;
+    let mut out = packet.to_vec();
+    let mut at = 20;
+    while at + 4 <= out.len() {
+        let kind = u16::from_be_bytes([out[at], out[at + 1]]);
+        let len = usize::from(u16::from_be_bytes([out[at + 2], out[at + 3]]));
+        let end = at + 4 + len;
+        if end > out.len() {
+            break;
+        }
+        if kind == FINGERPRINT && len == 4 {
+            let held = crc32fast::hash(&packet[..at]) ^ 0x5354_554E;
+            if out[at + 4..end] == held.to_be_bytes() {
+                let crc = crc32fast::hash(&out[..at]) ^ 0x5354_554E;
+                out[at + 4..end].copy_from_slice(&crc.to_be_bytes());
+            }
+        } else if kind != XOR_MAPPED_ADDRESS {
+            out[at + 4..end].fill(b'a');
+        }
+        at += 4 + len.next_multiple_of(4);
+    }
+    out
+}
+
 fn addr() -> impl Strategy<Value = SocketAddr> {
     prop_oneof![
         (any::<[u8; 4]>(), any::<u16>()).prop_map(|(ip, port)| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)),
@@ -86,28 +117,22 @@ proptest! {
         cut in any::<Option<usize>>(),
     ) {
         let mut packet = encode_response(txn, addr, software.as_deref(), fingerprint);
-        // The codec does not read SOFTWARE, which stun-rs holds to UTF-8: its value is
-        // left alone, so a difference there is not counted.
-        let address_len = if addr.is_ipv4() { 12 } else { 24 };
-        let text = 20 + address_len + 4..20 + address_len + 4 + software.as_ref().map_or(0, |s| s.len());
         for (at, bits) in flips {
             let at = at % packet.len();
-            if !text.contains(&at) {
-                packet[at] ^= bits;
-            }
+            packet[at] ^= bits;
         }
         if let Some(cut) = cut {
             packet.truncate(cut % (packet.len() + 1));
         }
         if let Some(ours) = try_decode(&packet) {
-            prop_assert_eq!(Some(ours), reference(&packet), "{:?}", packet);
+            prop_assert_eq!(Some(ours), reference(&unread_as_text(&packet)), "{:?}", packet);
         }
     }
 
     #[test]
     fn random_bytes_never_panic(packet in proptest::collection::vec(any::<u8>(), 0..200)) {
         if let Some(ours) = try_decode(&packet) {
-            prop_assert_eq!(Some(ours), reference(&packet));
+            prop_assert_eq!(Some(ours), reference(&unread_as_text(&packet)));
         }
     }
 }
