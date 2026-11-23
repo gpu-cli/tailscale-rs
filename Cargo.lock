@@ -6357,6 +6357,9 @@ name = "ts_netcheck"
 version = "0.7.1"
 dependencies = [
  "bytes",
+ "crc32fast",
+ "proptest",
+ "rand 0.10.3",
  "reqwest",
  "serde_json",
  "stun-rs",
