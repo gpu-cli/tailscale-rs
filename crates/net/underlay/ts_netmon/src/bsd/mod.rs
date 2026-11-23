@@ -357,12 +357,39 @@ fn iid(index: impl Into<u64>) -> InterfaceId {
 ///
 /// See <https://github.com/tailscale/tailscale/tree/2767100/net/netmon/netmon_darwin.go#L134>
 pub fn ignore_interface_name(name: &str) -> bool {
-    regex::regex!(r#"^(:?llw|awdl|ipsec|gif|XHC|anpi|lo|utun)\d*$"#).is_match(name)
+    const IGNORED: [&str; 8] = ["llw", "awdl", "ipsec", "gif", "XHC", "anpi", "lo", "utun"];
+    IGNORED.iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|unit| unit.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 fn is_unicast_link_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_link_local(),
         IpAddr::V6(ip) => ip.is_unicast_link_local(),
+    }
+}
+
+#[cfg(test)]
+mod ignored_names {
+    use super::ignore_interface_name;
+
+    #[test]
+    fn a_listed_name_with_only_a_unit_number_is_ignored() {
+        for name in [
+            "lo0", "utun", "utun12", "awdl0", "llw0", "ipsec3", "gif0", "XHC20", "anpi1",
+        ] {
+            assert!(ignore_interface_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn any_other_name_is_not() {
+        for name in [
+            "en0", "bridge0", "lo0a", "utunx", ":lo0", "loop", "xhc0", "", "0lo", "lo٣",
+        ] {
+            assert!(!ignore_interface_name(name), "{name}");
+        }
     }
 }
