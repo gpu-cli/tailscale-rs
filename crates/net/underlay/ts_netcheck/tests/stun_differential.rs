@@ -40,14 +40,15 @@ fn reference(packet: &[u8]) -> Option<(TransactionId, SocketAddr)> {
     Some((TransactionId(*msg.transaction_id().as_bytes()), addr))
 }
 
-/// `packet` with the value of every attribute the codec does not read made ASCII text,
-/// and a FINGERPRINT that held over the original taken again over the result. stun-rs
-/// refuses a SOFTWARE (or other text attribute) that is not UTF-8, which the codec never
-/// looks at; this is the same message to the codec, and one stun-rs can judge on what the
-/// codec does read.
-fn unread_as_text(packet: &[u8]) -> Vec<u8> {
+/// `packet` with every attribute the codec does not read renamed to an unassigned
+/// comprehension-optional type, and a FINGERPRINT that held over the original taken again
+/// over the result. stun-rs validates attributes such as SOFTWARE and ALTERNATE-DOMAIN
+/// that the codec never looks at; renamed, they are the same message to the codec, and
+/// stun-rs judges it only on what the codec reads.
+fn unread_as_unknown(packet: &[u8]) -> Vec<u8> {
     const XOR_MAPPED_ADDRESS: u16 = 0x0020;
     const FINGERPRINT: u16 = 0x8028;
+    const UNASSIGNED: u16 = 0xBFFF;
     let mut out = packet.to_vec();
     let mut at = 20;
     while at + 4 <= out.len() {
@@ -64,7 +65,7 @@ fn unread_as_text(packet: &[u8]) -> Vec<u8> {
                 out[at + 4..end].copy_from_slice(&crc.to_be_bytes());
             }
         } else if kind != XOR_MAPPED_ADDRESS {
-            out[at + 4..end].fill(b'a');
+            out[at..at + 2].copy_from_slice(&UNASSIGNED.to_be_bytes());
         }
         at += 4 + len.next_multiple_of(4);
     }
@@ -125,14 +126,14 @@ proptest! {
             packet.truncate(cut % (packet.len() + 1));
         }
         if let Some(ours) = try_decode(&packet) {
-            prop_assert_eq!(Some(ours), reference(&unread_as_text(&packet)), "{:?}", packet);
+            prop_assert_eq!(Some(ours), reference(&unread_as_unknown(&packet)), "{:?}", packet);
         }
     }
 
     #[test]
     fn random_bytes_never_panic(packet in proptest::collection::vec(any::<u8>(), 0..200)) {
         if let Some(ours) = try_decode(&packet) {
-            prop_assert_eq!(Some(ours), reference(&unread_as_text(&packet)));
+            prop_assert_eq!(Some(ours), reference(&unread_as_unknown(&packet)));
         }
     }
 }
