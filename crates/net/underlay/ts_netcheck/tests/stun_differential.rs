@@ -12,7 +12,12 @@ use stun_rs::{
 };
 use ts_netcheck::stun::{TransactionId, new_txn, try_decode};
 
-fn encode_response(txn: [u8; 12], addr: SocketAddr, software: Option<&str>, fingerprint: bool) -> Vec<u8> {
+fn encode_response(
+    txn: [u8; 12],
+    addr: SocketAddr,
+    software: Option<&str>,
+    fingerprint: bool,
+) -> Vec<u8> {
     let mut builder = StunMessageBuilder::new(BINDING, MessageClass::SuccessResponse)
         .with_transaction_id(stun_rs::TransactionId::from(txn))
         .with_attribute(XorMappedAddress::from(addr));
@@ -24,7 +29,10 @@ fn encode_response(txn: [u8; 12], addr: SocketAddr, software: Option<&str>, fing
     }
     let msg = builder.build();
     let mut buf = vec![0u8; 1024];
-    let n = MessageEncoderBuilder::default().build().encode(&mut buf, &msg).unwrap();
+    let n = MessageEncoderBuilder::default()
+        .build()
+        .encode(&mut buf, &msg)
+        .unwrap();
     buf.truncate(n);
     buf
 }
@@ -32,11 +40,19 @@ fn encode_response(txn: [u8; 12], addr: SocketAddr, software: Option<&str>, fing
 /// What stun-rs makes of `packet`, held to what this codec decodes: a Binding success
 /// response's transaction and XOR-mapped address.
 fn reference(packet: &[u8]) -> Option<(TransactionId, SocketAddr)> {
-    let (msg, n) = MessageDecoderBuilder::default().build().decode(packet).ok()?;
-    if n != packet.len() || msg.class() != MessageClass::SuccessResponse || msg.method() != BINDING {
+    let (msg, n) = MessageDecoderBuilder::default()
+        .build()
+        .decode(packet)
+        .ok()?;
+    if n != packet.len() || msg.class() != MessageClass::SuccessResponse || msg.method() != BINDING
+    {
         return None;
     }
-    let addr = *msg.get::<XorMappedAddress>()?.as_xor_mapped_address().ok()?.socket_address();
+    let addr = *msg
+        .get::<XorMappedAddress>()?
+        .as_xor_mapped_address()
+        .ok()?
+        .socket_address();
     Some((TransactionId(*msg.transaction_id().as_bytes()), addr))
 }
 
@@ -74,8 +90,10 @@ fn unread_as_unknown(packet: &[u8]) -> Vec<u8> {
 
 fn addr() -> impl Strategy<Value = SocketAddr> {
     prop_oneof![
-        (any::<[u8; 4]>(), any::<u16>()).prop_map(|(ip, port)| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)),
-        (any::<[u8; 16]>(), any::<u16>()).prop_map(|(ip, port)| SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)),
+        (any::<[u8; 4]>(), any::<u16>())
+            .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)),
+        (any::<[u8; 16]>(), any::<u16>())
+            .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)),
     ]
 }
 
@@ -83,7 +101,10 @@ fn addr() -> impl Strategy<Value = SocketAddr> {
 fn a_request_is_one_stun_rs_reads() {
     for _ in 0..1000 {
         let (txn, buf) = new_txn();
-        let (msg, n) = MessageDecoderBuilder::default().build().decode(&buf).unwrap();
+        let (msg, n) = MessageDecoderBuilder::default()
+            .build()
+            .decode(&buf)
+            .unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(msg.class(), MessageClass::Request);
         assert_eq!(msg.method(), BINDING);
