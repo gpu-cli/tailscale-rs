@@ -86,9 +86,15 @@ proptest! {
         cut in any::<Option<usize>>(),
     ) {
         let mut packet = encode_response(txn, addr, software.as_deref(), fingerprint);
+        // The codec does not read SOFTWARE, which stun-rs holds to UTF-8: its value is
+        // left alone, so a difference there is not counted.
+        let address_len = if addr.is_ipv4() { 12 } else { 24 };
+        let text = 20 + address_len + 4..20 + address_len + 4 + software.as_ref().map_or(0, |s| s.len());
         for (at, bits) in flips {
             let at = at % packet.len();
-            packet[at] ^= bits;
+            if !text.contains(&at) {
+                packet[at] ^= bits;
+            }
         }
         if let Some(cut) = cut {
             packet.truncate(cut % (packet.len() + 1));
