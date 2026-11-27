@@ -101,11 +101,12 @@ pub struct StateUpdate {
 
 /// Read a stream of netmap responses from `reader`, converting them into `StateUpdate`s.
 ///
-/// A stream's first response is a whole netmap: one that names no peers says the
-/// tailnet has none (control omits an empty `Peers`), so it is a full, empty peer update
-/// rather than no update, and a caller waiting for the peer list is answered.
+/// A stream's first netmap (its first response with the node; a keepalive may come
+/// ahead of it) is a whole one: one that names no peers says the tailnet has none
+/// (control omits an empty `Peers`), so it is a full, empty peer update rather than no
+/// update, and a caller waiting for the peer list is answered.
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
-    futures_util::stream::unfold((reader, true), async |(mut reader, first)| {
+    futures_util::stream::unfold((reader, true), async |(mut reader, awaiting_netmap)| {
         let msg_len = reader
             .read_u32_le()
             .await
@@ -134,6 +135,8 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
         tracing::trace!(?msg_len, ?map_response);
 
         let packetfilter = packet_filter(&map_response);
+        // A keepalive or other partial response ahead of the netmap leaves it awaited.
+        let still_awaiting = awaiting_netmap && map_response.node.is_none();
 
         fn nonempty<T>(x: &Option<Vec<T>>) -> bool {
             x.as_ref().is_some_and(|x| !x.is_empty())
@@ -196,7 +199,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .map(Into::into)
                     .collect(),
             })
-        } else if first && map_response.node.is_some() {
+        } else if awaiting_netmap && map_response.node.is_some() {
             Some(PeerUpdate::Full(Vec::new()))
         } else {
             None
@@ -219,7 +222,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                 }),
                 dial_plan: map_response.control_dial_plan.map(Into::into),
             },
-            (reader, false),
+            (reader, still_awaiting),
         ))
     })
 }
@@ -343,6 +346,31 @@ mod tests {
             updates[0].peer_update.is_none(),
             "{:?}",
             updates[0].peer_update
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_ahead_of_the_netmap_leaves_the_netmap_its_empty_peer_update() {
+        let keepalive = "{\"KeepAlive\": true}".to_owned();
+        let netmap = format!("{{\"Node\": {NODE}}}");
+        let updates: Vec<StateUpdate> = map_stream(frames(&[keepalive.clone(), netmap, keepalive]))
+            .collect()
+            .await;
+        assert_eq!(updates.len(), 3);
+        assert!(
+            updates[0].peer_update.is_none(),
+            "{:?}",
+            updates[0].peer_update
+        );
+        assert!(
+            matches!(&updates[1].peer_update, Some(PeerUpdate::Full(peers)) if peers.is_empty()),
+            "{:?}",
+            updates[1].peer_update
+        );
+        assert!(
+            updates[2].peer_update.is_none(),
+            "{:?}",
+            updates[2].peer_update
         );
     }
 }
