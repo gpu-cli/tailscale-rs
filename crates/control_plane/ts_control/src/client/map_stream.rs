@@ -99,6 +99,10 @@ pub struct StateUpdate {
     pub dial_plan: Option<DialPlan>,
 }
 
+/// The largest map response read: far past any real netmap, and short of a length
+/// prefix that would have the client allocate gigabytes before the body arrives.
+const MAX_MAP_RESPONSE: u32 = 64 << 20;
+
 /// Read a stream of netmap responses from `reader`, converting them into `StateUpdate`s.
 ///
 /// A stream's first netmap (its first response with the node; a keepalive may come
@@ -115,6 +119,10 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
             })
             .ok()?;
 
+        if msg_len > MAX_MAP_RESPONSE {
+            tracing::error!(?msg_len, "netmap larger than any control sends");
+            return None;
+        }
         let mut buf = PacketMut::new(msg_len as usize);
         tracing::trace!(?msg_len, "reading netmap");
 
@@ -126,11 +134,15 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
             })
             .ok()?;
 
-        let map_response: MapResponse = serde_json::from_slice(buf.as_ref())
+        let mut map_response: MapResponse = serde_json::from_slice(buf.as_ref())
             .inspect_err(|e| {
                 tracing::error!(error = %e, "deserializing netmap");
             })
             .ok()?;
+        // A keepalive's other fields are to be ignored, its node among them.
+        if map_response.keep_alive == Some(true) {
+            map_response.node = None;
+        }
 
         tracing::trace!(?msg_len, ?map_response);
 
@@ -347,6 +359,27 @@ mod tests {
             "{:?}",
             updates[0].peer_update
         );
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_carrying_a_node_is_not_taken_for_the_netmap() {
+        let keepalive = format!("{{\"KeepAlive\": true, \"Node\": {NODE}}}");
+        let updates: Vec<StateUpdate> = map_stream(frames(&[keepalive])).collect().await;
+        assert_eq!(updates.len(), 1);
+        assert!(
+            updates[0].peer_update.is_none(),
+            "{:?}",
+            updates[0].peer_update
+        );
+        assert!(updates[0].node.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_length_past_any_netmap_ends_the_stream_unread() {
+        let mut bytes = (MAX_MAP_RESPONSE + 1).to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        let updates: Vec<StateUpdate> = map_stream(std::io::Cursor::new(bytes)).collect().await;
+        assert!(updates.is_empty());
     }
 
     #[tokio::test]
