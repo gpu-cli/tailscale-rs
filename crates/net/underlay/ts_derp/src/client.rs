@@ -161,9 +161,18 @@ where
         loop {
             let frame = {
                 let mut r = self.read_conn.lock().await;
-                r.next().await.ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "derp stream ended")
-                })??
+                // The server sends a keepalive at least every KEEP_ALIVE seconds: a
+                // connection silent for two of those is dead (a network change, or a
+                // mobile app suspended), though its socket may never say so.
+                let silence = std::time::Duration::from_secs(2 * frame::KEEP_ALIVE as u64 + 10);
+                tokio::time::timeout(silence, r.next())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "derp server went silent")
+                    })?
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "derp stream ended")
+                    })??
             };
             let frame = frame.get();
 
@@ -203,8 +212,10 @@ where
 
                     return Ok((recv.src, payload.into()));
                 }
+                // Frames this client has no use for (health, restarting, server info
+                // sent again) are no reason to drop the connection.
                 t => {
-                    return Err(Error::UnexpectedRecvFrameType(t));
+                    tracing::debug!(frame_type = ?t, "ignoring derp frame");
                 }
             }
         }

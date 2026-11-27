@@ -231,12 +231,31 @@ struct Runner {
 impl Runner {
     const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
+    const RETRY_FIRST: Duration = Duration::from_millis(250);
+    const RETRY_MOST: Duration = Duration::from_secs(10);
+
+    /// Keeps this region's connection for as long as the runtime runs. A connection that
+    /// fails or drops (a network change, or a mobile app's sockets closed while it was
+    /// suspended) is made again, after a pause that doubles up to a bound: peers send
+    /// to this node's home region, and a home connection that stays down cuts the node
+    /// off from every reply.
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id))]
     async fn run(&mut self) -> Result<(), ts_derp::Error> {
+        let mut pause = Self::RETRY_FIRST;
         loop {
             let pending = self.wait_for_activity().await;
-            let transport = self.connect(pending).await?;
-            self.run_transport(transport).await?;
+            let failed = match self.connect(pending).await {
+                Ok(transport) => {
+                    pause = Self::RETRY_FIRST;
+                    self.run_transport(transport).await.err()
+                }
+                Err(e) => Some(e),
+            };
+            if let Some(e) = failed {
+                tracing::warn!(error = %e, retry_in = ?pause, "derp connection failed");
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Self::RETRY_MOST);
+            }
         }
     }
 
