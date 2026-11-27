@@ -100,8 +100,12 @@ pub struct StateUpdate {
 }
 
 /// Read a stream of netmap responses from `reader`, converting them into `StateUpdate`s.
+///
+/// A stream's first response is a whole netmap: one that names no peers says the
+/// tailnet has none (control omits an empty `Peers`), so it is a full, empty peer update
+/// rather than no update, and a caller waiting for the peer list is answered.
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
-    futures_util::stream::unfold(reader, async |mut reader| {
+    futures_util::stream::unfold((reader, true), async |(mut reader, first)| {
         let msg_len = reader
             .read_u32_le()
             .await
@@ -192,6 +196,8 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .map(Into::into)
                     .collect(),
             })
+        } else if first && map_response.node.is_some() {
+            Some(PeerUpdate::Full(Vec::new()))
         } else {
             None
         };
@@ -213,7 +219,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                 }),
                 dial_plan: map_response.control_dial_plan.map(Into::into),
             },
-            reader,
+            (reader, false),
         ))
     })
 }
@@ -277,4 +283,66 @@ pub async fn send_map_request(
     }
 
     Ok(resp.into_read())
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+
+    use super::*;
+
+    const NODE: &str = include_str!("../../../ts_control_serde/tests/data/node.json");
+
+    /// The length-prefixed frames a map stream carries.
+    fn frames(bodies: &[String]) -> std::io::Cursor<Vec<u8>> {
+        let mut out = Vec::new();
+        for body in bodies {
+            out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(body.as_bytes());
+        }
+        std::io::Cursor::new(out)
+    }
+
+    #[tokio::test]
+    async fn a_first_netmap_without_peers_is_a_full_empty_peer_update() {
+        let first = format!("{{\"Node\": {NODE}}}");
+        let updates: Vec<StateUpdate> = map_stream(frames(&[first])).collect().await;
+        assert_eq!(updates.len(), 1);
+        assert!(
+            matches!(&updates[0].peer_update, Some(PeerUpdate::Full(peers)) if peers.is_empty()),
+            "{:?}",
+            updates[0].peer_update
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_response_without_peers_leaves_the_peers_as_they_are() {
+        let with_node = format!("{{\"Node\": {NODE}}}");
+        let updates: Vec<StateUpdate> =
+            map_stream(frames(&[with_node.clone(), with_node, "{}".to_owned()]))
+                .collect()
+                .await;
+        assert_eq!(updates.len(), 3);
+        assert!(
+            updates[1].peer_update.is_none(),
+            "{:?}",
+            updates[1].peer_update
+        );
+        assert!(
+            updates[2].peer_update.is_none(),
+            "{:?}",
+            updates[2].peer_update
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_response_without_the_node_is_not_taken_for_a_netmap() {
+        let updates: Vec<StateUpdate> = map_stream(frames(&["{}".to_owned()])).collect().await;
+        assert_eq!(updates.len(), 1);
+        assert!(
+            updates[0].peer_update.is_none(),
+            "{:?}",
+            updates[0].peer_update
+        );
+    }
 }
