@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, OnceLock},
+};
 
 use kameo::{
     actor::ActorRef,
@@ -17,6 +21,20 @@ use crate::{
     path_discoverer::{BestPathMap, BestPaths},
     peer_tracker::PeerState,
 };
+
+/// Whether `TS_DEBUG_ALWAYS_USE_DERP` is `1` or `true`: then a peer is reached only
+/// through DERP, never over a direct path, as the Go client's knob of that name does.
+/// For tests whose relay must be the only path, as one between devices on one machine is
+/// not.
+fn always_use_derp() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("TS_DEBUG_ALWAYS_USE_DERP").as_deref(),
+            Ok("1" | "true")
+        )
+    })
+}
 
 pub struct RouteUpdater {
     default_overlay_transport: OverlayTransportId,
@@ -48,7 +66,10 @@ impl RouteUpdater {
             )
             .entered();
 
-            let (transport_id, ep) = if let Some((transport_id, ep)) = self.best_paths.get(id) {
+            let direct = (!always_use_derp())
+                .then(|| self.best_paths.get(id))
+                .flatten();
+            let (transport_id, ep) = if let Some((transport_id, ep)) = direct {
                 (*transport_id, ep.clone())
             } else if let Some(region) = peer.derp_region
                 && let Some(transport_id) = self.derp_transport_map.0.get(&region)
@@ -150,7 +171,7 @@ impl Message<PeerPath> for RouteUpdater {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Option<PathKind> {
         let (id, peer) = self.peer_state.peers.get(&ip)?;
-        if self.best_paths.contains_key(&id) {
+        if !always_use_derp() && self.best_paths.contains_key(&id) {
             Some(PathKind::Direct)
         } else if peer
             .derp_region
