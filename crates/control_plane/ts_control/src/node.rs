@@ -167,6 +167,13 @@ pub struct Node {
     /// The tags assigned to this node.
     pub tags: Vec<String>,
 
+    /// The id of the user who owns this node. For a tagged node the tags, not this user,
+    /// are its identity.
+    pub user_id: ts_control_serde::UserId,
+    /// The login name (an email or email-ish string) of the user who owns this node, once
+    /// control has sent that user's profile.
+    pub user_login: Option<String>,
+
     /// The address of the node in the tailnet.
     pub tailnet_address: TailnetAddress,
 
@@ -353,6 +360,10 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .map(|x| x.iter().map(|x| x.to_string()).collect())
                 .unwrap_or_default(),
 
+            user_id: value.user,
+            // Filled in from the netmap's user profiles, which arrive beside the node.
+            user_login: None,
+
             tailnet_address: TailnetAddress {
                 ipv4: value.addresses.0,
                 ipv6: value.addresses.1,
@@ -485,6 +496,8 @@ mod known_disco_key_tests {
             tailnet: None,
             node_capabilities: Default::default(),
             tags: vec![],
+            user_id: 0,
+            user_login: None,
             tailnet_address: TailnetAddress {
                 ipv4: "100.64.0.7/32".parse().unwrap(),
                 ipv6: "fd7a:115c:a1e0::7/128".parse().unwrap(),

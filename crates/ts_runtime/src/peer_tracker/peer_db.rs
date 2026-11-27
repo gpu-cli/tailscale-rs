@@ -586,6 +586,8 @@ pub(crate) mod test {
                 .map(|_| rand_string(&mut rng, 32))
                 .collect(),
             node_capabilities: Default::default(),
+            user_id: rng.random(),
+            user_login: None,
         }
     }
 
@@ -892,6 +894,8 @@ pub(crate) mod test {
                         ipv6: ipv6.into(),
                     },
                     tags: tags.into_iter().collect(),
+                    user_id: 0,
+                    user_login: None,
                     node_capabilities,
 
                     derp_region: derp_region.map(ts_derp::RegionId),

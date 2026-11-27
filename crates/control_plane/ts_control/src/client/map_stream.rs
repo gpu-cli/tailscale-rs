@@ -3,7 +3,7 @@ use alloc::collections::BTreeMap;
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use ts_control_serde::{MapRequest, MapResponse, PingRequest};
+use ts_control_serde::{MapRequest, MapResponse, PingRequest, UserId};
 use ts_http_util::{BytesBody, ClientExt, Http2, ResponseExt};
 use ts_packet::PacketMut;
 use ts_packetfilter as pf;
@@ -100,8 +100,12 @@ pub struct StateUpdate {
 }
 
 /// Read a stream of netmap responses from `reader`, converting them into `StateUpdate`s.
+///
+/// Each node carries its owner's login. Control sends a user's profile only once, or when it
+/// changes, so the logins seen so far are kept for the nodes of later responses.
 pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpdate> {
-    futures_util::stream::unfold(reader, async |mut reader| {
+    let logins: BTreeMap<UserId, String> = BTreeMap::new();
+    futures_util::stream::unfold((reader, logins), async |(mut reader, mut logins)| {
         let msg_len = reader
             .read_u32_le()
             .await
@@ -129,6 +133,15 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
 
         tracing::trace!(?msg_len, ?map_response);
 
+        for profile in &map_response.user_profiles {
+            logins.insert(profile.id, profile.login_name.to_owned());
+        }
+        let owned = |node: &ts_control_serde::Node<'_>| {
+            let mut node = crate::Node::from(node);
+            node.user_login = logins.get(&node.user_id).cloned();
+            node
+        };
+
         let packetfilter = packet_filter(&map_response);
 
         fn nonempty<T>(x: &Option<Vec<T>>) -> bool {
@@ -136,7 +149,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
         }
 
         let peer_update = if let Some(full_map) = map_response.peers {
-            Some(PeerUpdate::Full(full_map.iter().map(Into::into).collect()))
+            Some(PeerUpdate::Full(full_map.iter().map(owned).collect()))
         } else if nonempty(&map_response.peers_removed)
             || nonempty(&map_response.peers_changed)
             || !map_response.peer_seen_change.is_empty()
@@ -189,7 +202,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                     .peers_changed
                     .unwrap_or_default()
                     .iter()
-                    .map(Into::into)
+                    .map(owned)
                     .collect(),
             })
         } else {
@@ -199,7 +212,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
         Some((
             StateUpdate {
                 peer_update,
-                node: map_response.node.as_ref().map(Into::into),
+                node: map_response.node.as_ref().map(owned),
                 derp: map_response
                     .derp_map
                     .as_ref()
@@ -213,7 +226,7 @@ pub fn map_stream(reader: impl AsyncRead + Unpin) -> impl Stream<Item = StateUpd
                 }),
                 dial_plan: map_response.control_dial_plan.map(Into::into),
             },
-            reader,
+            (reader, logins),
         ))
     })
 }
@@ -277,4 +290,70 @@ pub async fn send_map_request(
     }
 
     Ok(resp.into_read())
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+
+    use super::*;
+
+    const NODE: &str = include_str!("../../../ts_control_serde/tests/data/node.json");
+
+    fn node(id: u64, user: i64) -> serde_json::Value {
+        let mut node: serde_json::Value = serde_json::from_str(NODE).unwrap();
+        node["ID"] = id.into();
+        node["StableID"] = format!("n{id}").into();
+        node["Name"] = format!("n{id}.example.ts.net.").into();
+        node["User"] = user.into();
+        node
+    }
+
+    fn frame(out: &mut Vec<u8>, response: serde_json::Value) {
+        let body = serde_json::to_vec(&response).unwrap();
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+    }
+
+    fn peers(update: &StateUpdate) -> Vec<crate::Node> {
+        match update.peer_update.as_ref().unwrap() {
+            PeerUpdate::Full(nodes) => nodes.clone(),
+            PeerUpdate::Delta { upsert, .. } => upsert.clone(),
+        }
+    }
+
+    /// A node takes its owner's login from the profile sent beside it, and keeps finding it
+    /// in later responses, which carry only new or changed profiles.
+    #[tokio::test]
+    async fn nodes_carry_their_owners_login() {
+        let mut bytes = Vec::new();
+        frame(
+            &mut bytes,
+            serde_json::json!({
+                "Node": node(1, 42),
+                "Peers": [node(2, 42), node(3, 7)],
+                "UserProfiles": [{"ID": 42, "LoginName": "alice@example.com"}],
+            }),
+        );
+        frame(
+            &mut bytes,
+            serde_json::json!({
+                "PeersChanged": [node(4, 42), node(5, 9)],
+                "UserProfiles": [{"ID": 9, "LoginName": "bob@example.com"}],
+            }),
+        );
+        let updates: Vec<StateUpdate> = map_stream(bytes.as_slice()).collect().await;
+        assert_eq!(updates.len(), 2);
+
+        let me = updates[0].node.as_ref().unwrap();
+        assert_eq!(me.user_login.as_deref(), Some("alice@example.com"));
+        let first = peers(&updates[0]);
+        assert_eq!(first[0].user_login.as_deref(), Some("alice@example.com"));
+        assert_eq!(first[1].user_id, 7);
+        assert_eq!(first[1].user_login, None, "no profile was sent for user 7");
+
+        let later = peers(&updates[1]);
+        assert_eq!(later[0].user_login.as_deref(), Some("alice@example.com"));
+        assert_eq!(later[1].user_login.as_deref(), Some("bob@example.com"));
+    }
 }
