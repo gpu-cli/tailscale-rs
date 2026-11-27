@@ -35,6 +35,10 @@ impl PeerTracker {
     fn peer_by_tailnet_ip_opt(&self, ip: IpAddr) -> Option<&Node> {
         self.peer_db.get(&ip).map(|(_id, node)| node)
     }
+
+    fn all_peers_now(&self) -> Vec<Node> {
+        self.peer_db.iter().map(|(_id, node)| node.clone()).collect()
+    }
 }
 
 impl kameo::Actor for PeerTracker {
@@ -58,6 +62,7 @@ enum Pending {
     PeerByName(PeerByName, ReplySender<Option<Node>>),
     AcceptedRoute(PeerByAcceptedRoute, ReplySender<Vec<Node>>),
     TailnetIp(PeerByTailnetIp, ReplySender<Option<Node>>),
+    All(ReplySender<Vec<Node>>),
 }
 
 // For messages with arguments, a struct is generated with the args as fields. They aren't
@@ -161,6 +166,28 @@ mod msg_impl {
             }
 
             sender.send(self.peer_by_tailnet_ip_opt(ip).cloned());
+
+            deleg
+        }
+
+        /// Every peer in the netmap.
+        ///
+        /// Waits until we've received at least one peer update from control.
+        #[message(ctx)]
+        pub fn all_peers(
+            &mut self,
+            ctx: &mut Context<Self, DelegatedReply<Vec<Node>>>,
+        ) -> DelegatedReply<Vec<Node>> {
+            let (deleg, sender) = ctx.reply_sender();
+            let Some(sender) = sender else { return deleg };
+
+            if !self.seen_state_update {
+                tracing::debug!("no peer state seen yet, queueing request for all peers");
+                self.pending_requests.push(Pending::All(sender));
+                return deleg;
+            }
+
+            sender.send(self.all_peers_now());
 
             deleg
         }
@@ -295,6 +322,9 @@ impl PeerTracker {
                 }
                 Pending::TailnetIp(PeerByTailnetIp { ip }, reply) => {
                     reply.send(self.peer_by_tailnet_ip_opt(ip).cloned());
+                }
+                Pending::All(reply) => {
+                    reply.send(self.all_peers_now());
                 }
                 Pending::AcceptedRoute(PeerByAcceptedRoute { ip }, reply) => {
                     reply.send(

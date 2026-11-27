@@ -334,6 +334,15 @@ impl Device {
             .map_err(Into::into)
     }
 
+    /// Every peer in this device's netmap, as control last described them.
+    pub async fn peers(&self) -> Result<Vec<NodeInfo>, Error> {
+        self.runtime
+            .ask(ts_runtime::peer_tracker::AllPeers)
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
+    }
+
     /// Look up the peer(s) with the most-specific route matches for `ip`.
     pub async fn peers_with_route(&self, ip: IpAddr) -> Result<Vec<NodeInfo>, Error> {
         self.runtime

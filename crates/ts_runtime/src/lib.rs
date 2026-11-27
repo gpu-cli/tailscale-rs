@@ -193,5 +193,6 @@ forward!(
     PeerTracker,
     peer_tracker::PeerByName,
     peer_tracker::PeerByTailnetIp,
-    peer_tracker::PeerByAcceptedRoute
+    peer_tracker::PeerByAcceptedRoute,
+    peer_tracker::AllPeers
 );
