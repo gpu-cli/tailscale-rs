@@ -132,6 +132,7 @@ pub use config::Config;
 pub use error::{Error, InternalErrorKind};
 #[doc(inline)]
 pub use ts_control::Node as NodeInfo;
+pub use ts_control::NodeStatus;
 #[doc(inline)]
 pub use ts_runtime::PathKind;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
